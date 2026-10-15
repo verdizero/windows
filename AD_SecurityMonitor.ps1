@@ -5,7 +5,7 @@
     with guidance for triage
 .DESCRIPTION
     Polls local or remote Windows Security logs, tracks per-host
-    event record IDs, and displays useful event context, piped into a
+    event record IDs, displays useful event context, and pipes into a
     CSV file for later review
 .EXAMPLE
     .\AD-SecurityMonitor.ps1 -ComputerName DC01,DC02
@@ -38,7 +38,9 @@ $checkpointPath = Join-Path $root "checkpoints.json"
 $alertPath = Join-Path $root "alerts.csv"
 $monitorLogPath = Join-Path $root "monitor.log"
 
-# These descriptions are starting points for triage, not verdicts.
+# Creates an event catalog with descriptions and triage guidance
+# for common security events. Not exhaustive, and also not verdicts
+# on whether an event is malicious or benign!!
 $eventCatalog = @{
     4624 = @{
         Severity = "Info"
@@ -212,7 +214,7 @@ function Write-MonitorLog {
 }
 
 function Get-EventData {
-    param($Event)
+    param($SecurityEvent)
 
     $result = @{}
     try {
@@ -260,7 +262,7 @@ function Get-EventDescription {
 function Send-Alert {
     param(
         [string]$HostName,
-        $Event,
+        $SecurityEvent,
         [hashtable]$Data
     )
 
@@ -281,9 +283,6 @@ function Send-Alert {
     $source = Get-FirstValue $Data @(
         "IpAddress", "ClientAddress", "Workstation",
         "WorkstationName", "CallerComputerName"
-    )
-    $group = Get-FirstValue $Data @(
-        "TargetUserName", "TargetSid", "GroupName"
     )
 
     $message = [string]$Event.Message
@@ -336,7 +335,7 @@ function Send-Alert {
         $HostName, $id, $Event.RecordId, $info.Severity)
 }
 
-# Load existing checkpoints.
+# Loads existing checkpoints
 $checkpoints = @{}
 if (Test-Path -LiteralPath $checkpointPath) {
     try {
@@ -357,8 +356,8 @@ Write-Host "Alert CSV: $alertPath"
 Write-Host "Press Ctrl+C to stop."
 Write-MonitorLog "Monitor starting for $($ComputerName -join ', ')"
 
-# Establish initial checkpoints. By default, only events after startup
-# are monitored. Optionally inspect a short lookback on first run.
+# Establish initial checkpoints - By default, only events after startup
+# are monitored; can inspect a short lookback on first run
 foreach ($hostName in $ComputerName) {
     if (-not $checkpoints.ContainsKey($hostName)) {
         try {
@@ -379,7 +378,7 @@ foreach ($hostName in $ComputerName) {
                     Sort-Object RecordId
                 )
 
-                foreach ($event in $initialEvents) {
+                foreach ($securityEvent in $initialEvents) {
                     $data = Get-EventData $event
                     Send-Alert -HostName $hostName -Event $event -Data $data
                 }
@@ -407,8 +406,7 @@ while ($true) {
 
             $lastId = [long]$checkpoints[$hostName]
 
-            # Query recent events and filter by the persisted record ID.
-            # The overlap handles events close to a polling boundary.
+            # Query recent events and filter by the persisted record ID
             $since = (Get-Date).AddMinutes(-10)
             $events = @(
                 Get-WinEvent -ComputerName $hostName `
@@ -420,7 +418,7 @@ while ($true) {
                 Sort-Object RecordId
             )
 
-            foreach ($event in $events) {
+            foreach ($securityEvent in $events) {
                 $data = Get-EventData $event
                 Send-Alert -HostName $hostName -Event $event -Data $data
 
@@ -436,7 +434,7 @@ while ($true) {
         }
     }
 
-    # Save checkpoints after each polling round.
+    # Save checkpoints after each polling cycle, so that the monitor can resume from the last processed event
     $checkpoints | ConvertTo-Json |
         Set-Content -LiteralPath $checkpointPath -Encoding UTF8
 
