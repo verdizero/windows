@@ -60,20 +60,6 @@ if ($rebootPending) {
     Add-Check "Pending System Reboot" "PASS" "No pending reboot flags detected."
 }
 
-# Windows Defender Operational Status
-if (Test-CommandAvailable "Get-MpComputerStatus") {
-    try {
-        $mp = Get-MpComputerStatus
-        if ($mp.AntivirusEnabled -and $mp.RealTimeProtectionEnabled) {
-            Add-Check "Antivirus Protection" "PASS" "Real-time protection enabled. Signatures updated: $($mp.AntivirusSignatureLastUpdated)"
-        } else {
-            Add-Check "Antivirus Protection" "WARN" "Antivirus or Real-time protection disabled." "Enable Microsoft Defender or third-party AV."
-        }
-    } catch {
-        Add-Check "Antivirus Protection" "INFO" $_.Exception.Message
-    }
-}
-
 # DNS resolver configuration
 try {
     $dns = Get-DnsClientServerAddress -AddressFamily IPv4 |
@@ -230,9 +216,9 @@ foreach ($dc in $DomainControllers) {
     foreach ($port in $requiredPorts) {
         $tcp = Test-NetConnection -ComputerName $dc -Port $port -WarningAction SilentlyContinue
         if ($tcp.TcpTestSucceeded) {
-            Add-Check "Port Check ($dc:$port)" "PASS" "TCP Port $port open."
+            Add-Check "Port Check (${dc}:${port})" "PASS" "TCP Port $port open."
         } else {
-            Add-Check "Port Check ($dc:$port)" "WARN" "TCP Port $port filtered or closed." "Check host firewalls and service states."
+            Add-Check "Port Check (${dc}:${port})" "WARN" "TCP Port $port filtered or closed." "Check host firewalls and service states."
         }
     }
 }
