@@ -83,7 +83,7 @@ try {
     Add-Check "Time synchronization" "WARN" $_.Exception.Message
 }
 
-# Local service checks; this is the machine running the script.
+# Local service checks on machine running the script
 foreach ($serviceName in @("Netlogon", "Kdc", "W32Time", "Dnscache")) {
     try {
         $service = Get-Service -Name $serviceName -ErrorAction Stop
@@ -139,7 +139,7 @@ if (Test-CommandAvailable "repadmin.exe") {
         "repadmin.exe not found." "Run on a machine with AD DS tools installed."
 }
 
-# DCDIAG: read-only tests, one per specified DC.
+# DCDIAG
 if (Test-CommandAvailable "dcdiag.exe") {
     foreach ($dc in $DomainControllers) {
         $safeName = $dc -replace '[^a-zA-Z0-9_.-]', '_'
@@ -158,8 +158,8 @@ if (Test-CommandAvailable "dcdiag.exe") {
     Add-Check "DCDIAG" "SKIP" "dcdiag.exe not found."
 }
 
-# Current machine's Security log: recent high-value event IDs.
-# This is not a substitute for collecting from every DC.
+# Current machine's security log checks recent high priority events
+    # You should still collect from every DC for a complete picture
 try {
     $since = (Get-Date).AddHours(-$EventLookbackHours)
     $ids = @(1102, 4719, 4720, 4722, 4724, 4726, 4728, 4732, 4740, 4756, 5136)
