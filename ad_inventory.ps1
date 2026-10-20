@@ -1,282 +1,754 @@
-# Verifies Active Directory RSAT tools are installed and attempts to install them if not found
-if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-    Write-Host "Active Directory module not found. Installing RSAT..." -ForegroundColor Yellow
-    Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0 -ErrorAction Stop
+#requires -Version 5.1
+<#
+.SYNOPSIS
+    Collects an Active Directory and DNS inventory and writes CSV and HTML reports.
+
+.DESCRIPTION
+    Read-only inventory/triage script. It does not disable accounts, change DNS,
+    or remediate findings. Run from an elevated PowerShell session with network
+    access to the domain and appropriate read permissions
+
+.PARAMETER OutputRoot
+    Parent directory under which a timestamped report directory is created
+
+.PARAMETER StaleDays
+    Number of days without a recorded logon before an enabled user/computer is
+    flagged as potentially stale
+
+.PARAMETER Server
+    Optional domain controller FQDN to use for Active Directory queries
+#>
+[CmdletBinding()]
+param(
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$OutputRoot = (Join-Path $env:USERPROFILE 'ADInventory'),
+
+    [Parameter()]
+    [ValidateRange(1, 3650)]
+    [int]$StaleDays = 90,
+
+    [Parameter()]
+    [string]$Server
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Add-Finding {
+    param(
+        [Parameter(Mandatory)][string]$Severity,
+        [Parameter(Mandatory)][string]$Object,
+        [Parameter(Mandatory)][string]$Issue,
+        [Parameter(Mandatory)][string]$Evidence
+    )
+
+    $script:Findings.Add([pscustomobject]@{
+        Severity = $Severity
+        Object   = $Object
+        Issue    = $Issue
+        Evidence = $Evidence
+    })
 }
 
-# DNS RSAT Check
-if (-not (Get-Module -ListAvailable -Name DnsServer)) {
-    Write-Host "DnsServer module not found. Script will fallback to WMI if needed..." -ForegroundColor Yellow
+function ConvertTo-RecordDataString {
+    param([Parameter(Mandatory)]$RecordData)
+
+    # DNS record data differs by record type, so builds a readable value from the
+    # populated properties rather than assuming every record has IPv4Address
+    $parts = foreach ($property in $RecordData.PSObject.Properties) {
+        $value = $property.Value
+
+        if ($null -eq $value) {
+            continue
+        }
+        elseif ($value -is [System.Net.IPAddress]) {
+            $value.IPAddressToString
+        }
+        elseif ($value -is [System.Array]) {
+            ($value -join ',')
+        }
+        elseif ($value -is [System.TimeSpan]) {
+            $value.ToString()
+        }
+        elseif (
+            $value -is [string] -or
+            $value.GetType().IsPrimitive -or
+            $value -is [decimal]
+        ) {
+            [string]$value
+        }
+        elseif ($value.PSObject.Properties['IPAddressToString']) {
+            $value.IPAddressToString
+        }
+        elseif ($value.PSObject.Properties['HostNameAlias']) {
+            $value.HostNameAlias
+        }
+        elseif ($value.PSObject.Properties['DescriptiveText']) {
+            $value.DescriptiveText
+        }
+        else {
+            $value.ToString()
+        }
+    }
+
+    return (@(
+        $parts | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_)
+        }
+    ) -join '; ')
+}
+
+function Export-CsvSafe {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (@($InputObject).Count -gt 0) {
+        $InputObject |
+            Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        # Write an empty file for predictable report contents
+        Set-Content -LiteralPath $Path -Value '' -Encoding UTF8
+    }
+}
+
+# 1. Active Directory module and domain discovery
+
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+    Write-Host 'Active Directory PowerShell module not found. Attempting RSAT installation...' -ForegroundColor Yellow
+
+    if (-not (Get-Command Add-WindowsCapability -ErrorAction SilentlyContinue)) {
+        throw 'The ActiveDirectory module is missing and Add-WindowsCapability is unavailable. Install RSAT Active Directory tools, then rerun this script.'
+    }
+
+    Add-WindowsCapability `
+        -Online `
+        -Name 'Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0' `
+        -ErrorAction Stop | Out-Null
 }
 
 Import-Module ActiveDirectory -ErrorAction Stop
 
-# Attempt automatic domain query and falls back to explicit DC if needed
-try {
-    $domain = Get-ADDomain -ErrorAction Stop
-} catch {
-    Write-Warning "Default ADWS discovery failed: $_"
-    $dcTarget = Read-Host "Enter the FQDN or IP of a target Domain Controller (e.g. dc01.domain.com)"
-    $domain = Get-ADDomain -Server$dcTarget -ErrorAction Stop
+if (-not $Server) {
+    try {
+        $domain = Get-ADDomain -ErrorAction Stop
+        $Server = $domain.PDCEmulator
+    }
+    catch {
+        Write-Warning "Automatic domain discovery failed: $($_.Exception.Message)"
+
+        $Server = Read-Host 'Enter the FQDN of a reachable domain controller'
+
+        if ([string]::IsNullOrWhiteSpace($Server)) {
+            throw 'A domain controller must be specified.'
+        }
+
+        $domain = Get-ADDomain -Server $Server -ErrorAction Stop
+    }
+}
+else {
+    $domain = Get-ADDomain -Server $Server -ErrorAction Stop
 }
 
-$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$outDir = Join-Path $OutputRoot$stamp
+# Use a consistent server for all AD queries
+$adServer = $Server
+
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+
+$outDir = Join-Path `
+    -Path $OutputRoot `
+    -ChildPath $stamp
+
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
-$findings = [System.Collections.Generic.List[object]]::new()
+$script:Findings = [System.Collections.Generic.List[object]]::new()
+
 $cutoff = (Get-Date).AddDays(-$StaleDays)
 
-Write-Host "Collecting inventory for $($domain.DNSRoot)..." -ForegroundColor Cyan
+Write-Host "Collecting inventory for $($domain.DNSRoot) via $adServer..." -ForegroundColor Cyan
+Write-Host "Output directory: $outDir" -ForegroundColor DarkGray
 
-# 1. Domain controllers
-$dcs = Get-ADDomainController -Filter * |
-    Select-Object HostName, IPv4Address, Site, IsGlobalCatalog,
-        IsReadOnly, OperatingSystem, OperationMasterRoles
+# 2. Domain controllers
 
-$dcs \vert{} Export-Csv "$outDir\DomainControllers.csv" -NoTypeInformation
-
-# 2. Users
-$users = Get-ADUser -Filter * -Properties Enabled, LastLogonDate,
-    PasswordLastSet, PasswordNeverExpires, PasswordNotRequired,
-    AdminCount, ServicePrincipalNames, whenCreated |
-    Select-Object Name, SamAccountName, Enabled, LastLogonDate,
-        PasswordLastSet, PasswordNeverExpires, PasswordNotRequired,
-        AdminCount, ServicePrincipalNames, whenCreated, DistinguishedName
-
-$users \vert{} Export-Csv "$outDir\Users.csv" -NoTypeInformation
-
-foreach ($u in$users) {
-    if ($u.Enabled -and $u.PasswordNotRequired) {$findings.Add([pscustomobject]@{
-            Severity = "High"
-            Object = $u.SamAccountName
-            Issue = "Enabled account has PasswordNotRequired set"
-            Evidence = "PasswordNotRequired=True"
-        })
-    }
-
-    if ($u.Enabled -and $u.PasswordNeverExpires) {$findings.Add([pscustomobject]@{
-            Severity = "Medium"
-            Object = $u.SamAccountName
-            Issue = "Password never expires"
-            Evidence = "PasswordNeverExpires=True"
-        })
-    }
-
-    if ($u.Enabled -and $u.LastLogonDate -and$u.LastLogonDate -lt $cutoff) {$findings.Add([pscustomobject]@{
-            Severity = "Medium"
-            Object = $u.SamAccountName
-            Issue = "Potentially stale enabled user"
-            Evidence = "LastLogonDate=$($u.LastLogonDate)"
-        })
-    }
-}
-
-# 3. Computers
-$computers = Get-ADComputer -Filter * -Properties Enabled,
-    LastLogonDate, OperatingSystem, OperatingSystemVersion,
-    PasswordLastSet |
-    Select-Object Name, Enabled, LastLogonDate, OperatingSystem,
-        OperatingSystemVersion, PasswordLastSet, DistinguishedName
-
-$computers \vert{} Export-Csv "$outDir\Computers.csv" -NoTypeInformation
-
-foreach ($c in$computers) {
-    if ($c.Enabled -and $c.LastLogonDate -and$c.LastLogonDate -lt $cutoff) {$findings.Add([pscustomobject]@{
-            Severity = "Medium"
-            Object = $c.Name
-            Issue = "Potentially stale enabled computer"
-            Evidence = "LastLogonDate=$($c.LastLogonDate)"
-        })
-    }
-}
-
-# 4. Groups
-$groups = Get-ADGroup -Filter * -Properties GroupCategory,
-    GroupScope, AdminCount, whenCreated |
-    Select-Object Name, SamAccountName, SID, GroupCategory,
-        GroupScope, AdminCount, whenCreated, DistinguishedName
-
-$groups \vert{} Export-Csv "$outDir\Groups.csv" -NoTypeInformation
-
-# 5. Selected privileged groups
-$privilegedGroupNames = @(
-    "Domain Admins",
-    "Enterprise Admins",
-    "Schema Admins",
-    "Administrators"
+$dcs = @(
+    Get-ADDomainController -Filter * -Server $adServer |
+        Select-Object HostName,
+            IPv4Address,
+            Site,
+            IsGlobalCatalog,
+            IsReadOnly,
+            OperatingSystem,
+            OperationMasterRoles
 )
 
-$privileged = foreach ($name in$privilegedGroupNames) {
-    try {
-        $group = Get-ADGroup -Identity$name -ErrorAction Stop
-        Get-ADGroupMember -Identity $group -Recursive |
-            Select-Object @{N="PrivilegedGroup";E={$name}},
-                Name, SamAccountName, ObjectClass, SID
-    } catch {
-        Write-Warning "Could not query group '$name':$_"
+Export-CsvSafe `
+    -InputObject $dcs `
+    -Path (Join-Path $outDir 'DomainControllers.csv')
+
+# 3. Users and user-account triage
+
+$users = @(
+    Get-ADUser `
+        -Filter * `
+        -Server $adServer `
+        -Properties Enabled,
+            LastLogonDate,
+            PasswordLastSet,
+            PasswordNeverExpires,
+            PasswordNotRequired,
+            AdminCount,
+            ServicePrincipalNames,
+            whenCreated |
+        Select-Object Name,
+            SamAccountName,
+            Enabled,
+            LastLogonDate,
+            PasswordLastSet,
+            PasswordNeverExpires,
+            PasswordNotRequired,
+            AdminCount,
+            ServicePrincipalNames,
+            whenCreated,
+            DistinguishedName
+)
+
+Export-CsvSafe `
+    -InputObject $users `
+    -Path (Join-Path $outDir 'Users.csv')
+
+foreach ($u in $users) {
+
+    if ($u.Enabled -and $u.PasswordNotRequired) {
+        Add-Finding `
+            -Severity High `
+            -Object $u.SamAccountName `
+            -Issue 'Enabled account has PasswordNotRequired set' `
+            -Evidence 'PasswordNotRequired=True'
+    }
+
+    if ($u.Enabled -and $u.PasswordNeverExpires) {
+        Add-Finding `
+            -Severity Medium `
+            -Object $u.SamAccountName `
+            -Issue 'Password never expires' `
+            -Evidence 'PasswordNeverExpires=True'
+    }
+
+    if (
+        $u.Enabled -and
+        $u.LastLogonDate -and
+        $u.LastLogonDate -lt $cutoff
+    ) {
+        Add-Finding `
+            -Severity Medium `
+            -Object $u.SamAccountName `
+            -Issue 'Potentially stale enabled user' `
+            -Evidence "LastLogonDate=$($u.LastLogonDate)"
     }
 }
 
-$privileged \vert{} Export-Csv "$outDir\PrivilegedMembers.csv" -NoTypeInformation
+# 4. Computers and computer-account triage
 
-# 6. Default domain password policy
-try {
-    Get-ADDefaultDomainPasswordPolicy |
-        Select-Object ComplexityEnabled, MinPasswordLength,
-            PasswordHistoryCount, MaxPasswordAge, LockoutThreshold,
-            LockoutDuration, LockoutObservationWindow |
-        Export-Csv "$outDir\PasswordPolicy.csv" -NoTypeInformation
-} catch {
-    Write-Warning "Password policy query failed: $_"
+$computers = @(
+    Get-ADComputer `
+        -Filter * `
+        -Server $adServer `
+        -Properties Enabled,
+            LastLogonDate,
+            OperatingSystem,
+            OperatingSystemVersion,
+            PasswordLastSet |
+        Select-Object Name,
+            Enabled,
+            LastLogonDate,
+            OperatingSystem,
+            OperatingSystemVersion,
+            PasswordLastSet,
+            DistinguishedName
+)
+
+Export-CsvSafe `
+    -InputObject $computers `
+    -Path (Join-Path $outDir 'Computers.csv')
+
+foreach ($computer in $computers) {
+
+    if (
+        $computer.Enabled -and
+        $computer.LastLogonDate -and
+        $computer.LastLogonDate -lt $cutoff
+    ) {
+        Add-Finding `
+            -Severity Medium `
+            -Object $computer.Name `
+            -Issue 'Potentially stale enabled computer' `
+            -Evidence "LastLogonDate=$($computer.LastLogonDate)"
+    }
 }
 
-# 7. DNS zones, records and triage
-Write-Host "Querying DNS configuration..." -ForegroundColor Cyan
+# 5. Groups
 
-# Enumerate DNS zones
-try {
-    $dnsZones = Get-DnsServerZone -ErrorAction Stop | Select-Object ZoneName, ZoneType, DynamicUpdate, IsDsIntegrated, IsReverseLookupZone
-} catch {
-    $dnsZones = Get-CimInstance -Namespace "root\MicrosoftDNS" -ClassName "MicrosoftDNS_Zone" -ErrorAction SilentlyContinue |
-        Select-Object @{N="ZoneName";E={$_.Name}}, ZoneType, @{N="DynamicUpdate";E={$_.AllowUpdate}}, @{N="IsDsIntegrated";E={$_.DsIntegrated}}, @{N="IsReverseLookupZone";E={$_.Reverse}}
-}
+$groups = @(
+    Get-ADGroup `
+        -Filter * `
+        -Server $adServer `
+        -Properties GroupCategory,
+            GroupScope,
+            AdminCount,
+            whenCreated |
+        Select-Object Name,
+            SamAccountName,
+            SID,
+            GroupCategory,
+            GroupScope,
+            AdminCount,
+            whenCreated,
+            DistinguishedName
+)
 
-if ($dnsZones) {
-    $dnsZones \vert{} Export-Csv "$outDir\DNS_Zones.csv" -NoTypeInformation
+Export-CsvSafe `
+    -InputObject $groups `
+    -Path (Join-Path $outDir 'Groups.csv')
 
-    foreach ($zone in$dnsZones) {
-        if ($zone.DynamicUpdate -eq "NonsecureAndSecure" -or $zone.DynamicUpdate -eq 1) {$findings.Add([pscustomobject]@{
-                Severity = "High"
-                Object   = $zone.ZoneName
-                Issue    = "DNS Zone allows non-secure dynamic updates"
-                Evidence = "DynamicUpdate=$($zone.DynamicUpdate) (Allows unauthenticated DNS poisoning)"
-            })
+# 6. Members of selected privileged groups
+
+$privilegedGroupNames = @(
+    'Domain Admins'
+    'Enterprise Admins'
+    'Schema Admins'
+    'Administrators'
+)
+
+$privileged = @(
+    foreach ($groupName in $privilegedGroupNames) {
+
+        try {
+            $group = Get-ADGroup `
+                -Identity $groupName `
+                -Server $adServer `
+                -ErrorAction Stop
+
+            Get-ADGroupMember `
+                -Identity $group `
+                -Server $adServer `
+                -Recursive `
+                -ErrorAction Stop |
+                Select-Object @{
+                    Name = 'PrivilegedGroup'
+                    Expression = { $groupName }
+                },
+                Name,
+                SamAccountName,
+                ObjectClass,
+                SID
+        }
+        catch {
+            Write-Warning "Could not query privileged group '$groupName': $($_.Exception.Message)"
         }
     }
+)
 
-    # Dump DNS resource records
-    $dnsRecords = foreach ($zone in$dnsZones) {
-        $zName =$zone.ZoneName
+Export-CsvSafe `
+    -InputObject $privileged `
+    -Path (Join-Path $outDir 'PrivilegedMembers.csv')
+
+# 7. Default domain password policy
+
+try {
+    $passwordPolicy = @(
+        Get-ADDefaultDomainPasswordPolicy `
+            -Server $adServer `
+            -ErrorAction Stop |
+            Select-Object ComplexityEnabled,
+                MinPasswordLength,
+                PasswordHistoryCount,
+                MaxPasswordAge,
+                LockoutThreshold,
+                LockoutDuration,
+                LockoutObservationWindow
+    )
+
+    Export-CsvSafe `
+        -InputObject $passwordPolicy `
+        -Path (Join-Path $outDir 'PasswordPolicy.csv')
+}
+catch {
+    Write-Warning "Password policy query failed: $($_.Exception.Message)"
+}
+
+# 8. DNS zones, records, and triage
+
+Write-Host 'Querying DNS configuration...' -ForegroundColor Cyan
+
+$dnsZones = @()
+$dnsRecords = @()
+
+$dnsServerModuleAvailable = [bool](
+    Get-Module -ListAvailable -Name DnsServer
+)
+
+if ($dnsServerModuleAvailable) {
+
+    try {
+        Import-Module DnsServer -ErrorAction Stop
+
+        $dnsZones = @(
+            Get-DnsServerZone `
+                -ComputerName $adServer `
+                -ErrorAction Stop |
+                Select-Object ZoneName,
+                    ZoneType,
+                    DynamicUpdate,
+                    IsDsIntegrated,
+                    IsReverseLookupZone
+        )
+    }
+    catch {
+        Write-Warning "DNS PowerShell zone query failed: $($_.Exception.Message). Trying CIM/WMI fallback."
+    }
+}
+
+# Fallback if the DNS PowerShell module is unavailable or its query fails
+if ($dnsZones.Count -eq 0) {
+
+    try {
+        $dnsZones = @(
+            Get-CimInstance `
+                -ComputerName $adServer `
+                -Namespace 'root\MicrosoftDNS' `
+                -ClassName 'MicrosoftDNS_Zone' `
+                -ErrorAction Stop |
+                Select-Object @{
+                    Name = 'ZoneName'
+                    Expression = { $_.Name }
+                },
+                @{
+                    Name = 'ZoneType'
+                    Expression = { $_.ZoneType }
+                },
+                @{
+                    Name = 'DynamicUpdate'
+                    Expression = { $_.AllowUpdate }
+                },
+                @{
+                    Name = 'IsDsIntegrated'
+                    Expression = { $_.DsIntegrated }
+                },
+                @{
+                    Name = 'IsReverseLookupZone'
+                    Expression = { $_.Reverse }
+                }
+        )
+    }
+    catch {
+        Write-Warning "DNS zone inventory unavailable: $($_.Exception.Message)"
+    }
+}
+
+Export-CsvSafe `
+    -InputObject $dnsZones `
+    -Path (Join-Path $outDir 'DNS_Zones.csv')
+
+# Check DNS zone dynamic-update configuration
+foreach ($zone in $dnsZones) {
+
+    $dynamicUpdate = [string]$zone.DynamicUpdate
+
+    if ($dynamicUpdate -match '^(NonsecureAndSecure|1)$') {
+
+        Add-Finding `
+            -Severity High `
+            -Object $zone.ZoneName `
+            -Issue 'DNS zone allows non-secure dynamic updates' `
+            -Evidence "DynamicUpdate=$dynamicUpdate; review whether unauthenticated updates are required."
+    }
+}
+
+# Enumerate DNS resource records
+foreach ($zone in $dnsZones) {
+
+    $zoneName = [string]$zone.ZoneName
+
+    if ([string]::IsNullOrWhiteSpace($zoneName)) {
+        continue
+    }
+
+    $dnsRecordCommand = Get-Command `
+        Get-DnsServerResourceRecord `
+        -ErrorAction SilentlyContinue
+
+    if ($dnsServerModuleAvailable -and $dnsRecordCommand) {
+
         try {
-            Get-DnsServerResourceRecord -ZoneName $zName -ErrorAction Stop | ForEach-Object {
-                [pscustomobject]@{
-                    ZoneName   = $zName
-                    HostName   = $_.HostName
-                    RecordType = $_.RecordType
-                    RecordData = ($_.RecordData.IPv4Address.IPAddressToString + $_.RecordData.HostNameAlias +$_.RecordData.DescriptiveText) -join ""
-                    TimeToLive = $_.TimeToLive.TotalSeconds
-                    Timestamp  = $_.TimeStamp
+            $zoneRecords = Get-DnsServerResourceRecord `
+                -ComputerName $adServer `
+                -ZoneName $zoneName `
+                -ErrorAction Stop
+
+            foreach ($record in $zoneRecords) {
+
+                $dnsRecords += [pscustomobject]@{
+                    ZoneName   = $zoneName
+                    HostName   = $record.HostName
+                    RecordType = [string]$record.RecordType
+                    RecordData = ConvertTo-RecordDataString `
+                        -RecordData $record.RecordData
+                    TimeToLive = $record.TimeToLive.TotalSeconds
+                    Timestamp  = $record.Timestamp
                 }
             }
-        } catch {
-            Get-CimInstance -Namespace "root\MicrosoftDNS" -ClassName "MicrosoftDNS_ResourceRecord" -Filter "ContainerName='$zName'" -ErrorAction SilentlyContinue |
-                Select-Object @{N="ZoneName";E={$_.ContainerName}}, @{N="HostName";E={$_.OwnerName}}, @{N="RecordType";E={$_.RecordClass}}, @{N="RecordData";E={$_.TextRepresentation}}, TimeToLive, Timestamp
+
+            continue
+        }
+        catch {
+            Write-Warning "DNS record query failed for '$zoneName'; trying CIM/WMI fallback."
         }
     }
 
-    if ($dnsRecords) {
-        $dnsRecords \vert{} Export-Csv "$outDir\DNS_ResourceRecords.csv" -NoTypeInformation
+    # CIM/WMI fallback
+    try {
+        $escapedZoneName = $zoneName.Replace("'", "''")
 
-        foreach ($rec in$dnsRecords) {
-            # Check for WPAD / ISATAP hijacking risks
-            if ($rec.HostName -in @("wpad", "isatap") -and -not $rec.Timestamp) {$findings.Add([pscustomobject]@{
-                    Severity = "High"
-                    Object   = "$($rec.HostName).$($rec.ZoneName)"
-                    Issue    = "Static WPAD/ISATAP record detected"
-                    Evidence = "Points to $($rec.RecordData). High risk of MiTM hijacking."
-                })
-            }
+        $wmiRecords = Get-CimInstance `
+            -ComputerName $adServer `
+            -Namespace 'root\MicrosoftDNS' `
+            -ClassName 'MicrosoftDNS_ResourceRecord' `
+            -Filter "ContainerName='$escapedZoneName'" `
+            -ErrorAction Stop
 
-            # Check for static host records
-            if ($rec.RecordType -in @("A", "AAAA") -and -not $rec.Timestamp -and$rec.HostName -ne "@") {
-                $findings.Add([pscustomobject]@{
-                    Severity = "Low"
-                    Object   = "$($rec.HostName).$($rec.ZoneName)"
-                    Issue    = "Static A/AAAA record (No timestamp)"
-                    Evidence = "Target IP: $($rec.RecordData)"
-                })
-            }
+        foreach ($record in $wmiRecords) {
 
-            # Check for TXT records
-            if ($rec.RecordType -eq "TXT") {
-                $findings.Add([pscustomobject]@{
-                    Severity = "Medium"
-                    Object   = "$($rec.HostName).$($rec.ZoneName)"
-                    Issue    = "DNS TXT record found"
-                    Evidence = "Data: $($rec.RecordData)"
-                })
+            $dnsRecords += [pscustomobject]@{
+                ZoneName   = $record.ContainerName
+                HostName   = $record.OwnerName
+                RecordType = [string]$record.RecordClass
+                RecordData = [string]$record.TextRepresentation
+                TimeToLive = $record.TimeToLive
+                Timestamp  = $record.Timestamp
             }
         }
     }
-}
-
-# Check global query blockList status
-try {
-    $globalBlocklist = Get-DnsServerGlobalQueryBlockList -ErrorAction Stop
-    if (-not $globalBlocklist.Enable) {$findings.Add([pscustomobject]@{
-            Severity = "High"
-            Object   = "DNS Server Configuration"
-            Issue    = "DNS Global Query BlockList is disabled"
-            Evidence = "Enable = False (Allows WPAD/ISATAP resolution)"
-        })
+    catch {
+        Write-Warning "Could not query DNS records for '$zoneName': $($_.Exception.Message)"
     }
-} catch {
-    # Ignore error if run from a workstation target without local DNS Server module context
 }
 
+Export-CsvSafe `
+    -InputObject $dnsRecords `
+    -Path (Join-Path $outDir 'DNS_ResourceRecords.csv')
 
-# Export findings to CSV for triage
-$findings \vert{} Export-Csv "$outDir\Findings.csv" -NoTypeInformation
+# Analyze DNS records
+foreach ($record in $dnsRecords) {
 
-# Makes a neat little HTML report with findings and links to CSV exports :)
-$high = @($findings | Where-Object Severity -eq "High").Count
-$medium = @($findings | Where-Object Severity -eq "Medium").Count
+    $hostName = [string]$record.HostName
+    $recordType = [string]$record.RecordType
+    $recordObject = "$hostName.$($record.ZoneName)"
 
-$rows = foreach ($f in$findings) {
-    $severity = [System.Net.WebUtility]::HtmlEncode($f.Severity)
-    $obj = [System.Net.WebUtility]::HtmlEncode($f.Object)
-    $issue = [System.Net.WebUtility]::HtmlEncode($f.Issue)
-    $evidence = [System.Net.WebUtility]::HtmlEncode($f.Evidence)
+    # WPAD / ISATAP records with no timestamp warrant review
+    if (
+        $hostName -in @('wpad', 'isatap') -and
+        -not $record.Timestamp
+    ) {
+        Add-Finding `
+            -Severity High `
+            -Object $recordObject `
+            -Issue 'Static WPAD/ISATAP record detected' `
+            -Evidence "Record data: $($record.RecordData). Review whether this record is expected."
+    }
 
-    "<tr><td>$severity</td><td>$obj</td><td>$issue</td><td>$evidence</td></tr>"
+    # Static A / AAAA records are triage leads, not inherently malicious
+    if (
+        $recordType -in @('A', 'AAAA') -and
+        -not $record.Timestamp -and
+        $hostName -ne '@'
+    ) {
+        Add-Finding `
+            -Severity Low `
+            -Object $recordObject `
+            -Issue 'Static A/AAAA record (no timestamp)' `
+            -Evidence "Record data: $($record.RecordData)"
+    }
+
+    # TXT records may contain legitimate configuration data
+    if ($recordType -eq 'TXT') {
+
+        Add-Finding `
+            -Severity Medium `
+            -Object $recordObject `
+            -Issue 'DNS TXT record found (review contents)' `
+            -Evidence "Data: $($record.RecordData)"
+    }
 }
+
+# Check DNS global query block-list status on the selected server
+$blockListCommand = Get-Command `
+    Get-DnsServerGlobalQueryBlockList `
+    -ErrorAction SilentlyContinue
+
+if ($dnsServerModuleAvailable -and $blockListCommand) {
+
+    try {
+        $blockList = Get-DnsServerGlobalQueryBlockList `
+            -ComputerName $adServer `
+            -ErrorAction Stop
+
+        if (
+            $blockList.PSObject.Properties['Enable'] -and
+            -not $blockList.Enable
+        ) {
+            Add-Finding `
+                -Severity High `
+                -Object 'DNS Server Configuration' `
+                -Issue 'DNS Global Query BlockList is disabled' `
+                -Evidence 'Enable=False; review WPAD/ISATAP name-resolution exposure.'
+        }
+    }
+    catch {
+        Write-Warning "Could not query the DNS global query block list: $($_.Exception.Message)"
+    }
+}
+
+# Export findings and HTML report
+
+$findingsPath = Join-Path $outDir 'Findings.csv'
+
+Export-CsvSafe `
+    -InputObject @($script:Findings) `
+    -Path $findingsPath
+
+$high = @(
+    $script:Findings | Where-Object Severity -eq 'High'
+).Count
+
+$medium = @(
+    $script:Findings | Where-Object Severity -eq 'Medium'
+).Count
+
+$low = @(
+    $script:Findings | Where-Object Severity -eq 'Low'
+).Count
+
+$rows = foreach ($finding in $script:Findings) {
+
+    $severity = [System.Net.WebUtility]::HtmlEncode(
+        [string]$finding.Severity
+    )
+
+    $object = [System.Net.WebUtility]::HtmlEncode(
+        [string]$finding.Object
+    )
+
+    $issue = [System.Net.WebUtility]::HtmlEncode(
+        [string]$finding.Issue
+    )
+
+    $evidence = [System.Net.WebUtility]::HtmlEncode(
+        [string]$finding.Evidence
+    )
+
+    "<tr><td>$severity</td><td>$object</td><td>$issue</td><td>$evidence</td></tr>"
+}
+
+$domainNameHtml = [System.Net.WebUtility]::HtmlEncode(
+    [string]$domain.DNSRoot
+)
+
+$generatedAtHtml = [System.Net.WebUtility]::HtmlEncode(
+    (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+)
+
+$adServerHtml = [System.Net.WebUtility]::HtmlEncode(
+    [string]$adServer
+)
+
+$rowsHtml = $rows -join [Environment]::NewLine
 
 $html = @"
 <!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>AD Inventory Report</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Active Directory Inventory Report</title>
 <style>
-body { font-family: Segoe UI, Arial; margin: 30px; }
-table { border-collapse: collapse; width: 100%; }
-th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
-th { background: #e8eef5; }
+body {
+    font-family: Segoe UI, Arial, sans-serif;
+    margin: 2rem;
+    color: #202124;
+}
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+th, td {
+    border: 1px solid #ccc;
+    padding: 8px;
+    text-align: left;
+    vertical-align: top;
+}
+th {
+    background: #e8eef5;
+}
+tr:nth-child(even) {
+    background: #f8f9fa;
+}
+code {
+    overflow-wrap: anywhere;
+}
 </style>
 </head>
 <body>
 <h1>Active Directory Inventory</h1>
-<p>Domain: $($domain.DNSRoot)</p>
-<p>Generated: $(Get-Date)</p>
-<p>Users: $(@($users).Count) |
-Computers: $(@($computers).Count) |
-Groups: $(@($groups).Count) |
-DNS Zones: $(@($dnsZones).Count)</p>
+<p>Domain: $domainNameHtml</p>
+<p>Domain controller queried: $adServerHtml</p>
+<p>Generated: $generatedAtHtml</p>
+<p>
+Users: $($users.Count) |
+Computers: $($computers.Count) |
+Groups: $($groups.Count) |
+DNS Zones: $($dnsZones.Count)
+</p>
+
 <h2>Triage findings</h2>
-<p>High: $high \vert{} Medium:$medium</p>
-<p>Findings are leads for investigation, not proof of compromise.
-Review accounts and dependencies before taking action.</p>
+<p>High: $high | Medium: $medium | Low: $low</p>
+
+<p>
+Findings are leads for investigation, not proof of compromise.
+Review accounts and dependencies before taking action.
+Static DNS records and TXT records are not inherently malicious.
+</p>
+
 <table>
-<tr><th>Severity</th><th>Object</th><th>Issue</th><th>Evidence</th></tr>
-$($rows -join "`n")
+<thead>
+<tr>
+<th>Severity</th>
+<th>Object</th>
+<th>Issue</th>
+<th>Evidence</th>
+</tr>
+</thead>
+<tbody>
+$rowsHtml
+</tbody>
 </table>
 </body>
 </html>
 "@
 
-$html | Set-Content "$outDir\Report.html" -Encoding UTF8
+Set-Content `
+    -LiteralPath (Join-Path $outDir 'Report.html') `
+    -Value $html `
+    -Encoding UTF8
 
-Write-Host "`nInventory complete!" -ForegroundColor Green
-Write-Host "Report: $outDir\Report.html"
+
+Write-Host ''
+Write-Host 'Inventory complete.' -ForegroundColor Green
+Write-Host "HTML report: $(Join-Path $outDir 'Report.html')"
 Write-Host "CSV exports: $outDir"
