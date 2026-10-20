@@ -4,7 +4,11 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     exit 1
 }
 
-$NewLocalPassword = "Local!C0mpetit10n2026"
+function New-Password {
+    $password = Read-Host -Prompt "Enter a new password" -AsSecureString -AsPlainText
+    Write-Host "New password: $password -- PLEASE MAKE NOTE"
+}
+$NewLocalPassword = New-Password -Force
 
 # Add local usernames that scoring bots use to check service uptime
 $ExemptLocalUsers = @("scoring", "white_admin", "administrator") # Remove administrator if you want to change admin pswd
