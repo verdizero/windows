@@ -38,6 +38,15 @@ $checkpointPath = Join-Path $root "checkpoints.json"
 $alertPath = Join-Path $root "alerts.csv"
 $monitorLogPath = Join-Path $root "monitor.log"
 
+# Enables successful and failed auditing categories
+    # Viewable with with auditpol /get /category:*
+auditpol /get /category:*
+auditpol /set /subcategory:”Logon” /success:enable /failure:enable
+auditpol /set /subcategory:”User Account Management” /success:enable /failure:enable
+auditpol /set /subcategory:”Security Group Management” /success:enable /failure:enable
+auditpol /set /subcategory:”Process Creation” /success:enable /failure:enable
+auditpol /set /subcategory:”Audit Policy Change” /success:enable /failure:enable
+
 # Creates an event catalog with descriptions and triage guidance
 # for common security events. Not exhaustive, and also not verdicts
 # on whether an event is malicious or benign!!
