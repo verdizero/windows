@@ -1,6 +1,10 @@
 Import-Module ActiveDirectory
 
-$NewSecurePassword = ConvertTo-SecureString "C0mpetit10n!P@ssw0rd2026" -AsPlainText -Force
+function New-Password {
+    $password = Read-Host -Prompt "Enter a new password" -AsSecureString -AsPlainText
+    Write-Host "New password: $password -- PLEASE MAKE NOTE"
+}
+$NewSecurePassword = New-Password -Force
 $AdminGroup = "Domain Admins"
 
 # MUSTN'T CHANGE THE WHITE TEAM PEOPLE'S ACCOUNTS
