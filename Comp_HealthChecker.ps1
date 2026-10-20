@@ -2,7 +2,8 @@
 param(
     [string]$OutputRoot = ".\Competition-Health",
     [string[]]$DomainControllers = @(),
-    [int]$EventLookbackHours = 24
+    [int]$EventLookbackHours = 24,
+    [switch]$IncludeDism
 )
 
 $ErrorActionPreference = "Continue"
@@ -48,6 +49,31 @@ try {
     $DomainControllers = @()
 }
 
+# Pending Reboot Detection
+$rebootPending = $false
+if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") { $rebootPending = $true }
+if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") { $rebootPending = $true }
+
+if ($rebootPending) {
+    Add-Check "Pending System Reboot" "WARN" "Host has a pending system reboot." "Schedule host reboot during maintainance window."
+} else {
+    Add-Check "Pending System Reboot" "PASS" "No pending reboot flags detected."
+}
+
+# Windows Defender Operational Status
+if (Test-CommandAvailable "Get-MpComputerStatus") {
+    try {
+        $mp = Get-MpComputerStatus
+        if ($mp.AntivirusEnabled -and $mp.RealTimeProtectionEnabled) {
+            Add-Check "Antivirus Protection" "PASS" "Real-time protection enabled. Signatures updated: $($mp.AntivirusSignatureLastUpdated)"
+        } else {
+            Add-Check "Antivirus Protection" "WARN" "Antivirus or Real-time protection disabled." "Enable Microsoft Defender or third-party AV."
+        }
+    } catch {
+        Add-Check "Antivirus Protection" "INFO" $_.Exception.Message
+    }
+}
+
 # DNS resolver configuration
 try {
     $dns = Get-DnsClientServerAddress -AddressFamily IPv4 |
@@ -83,17 +109,34 @@ try {
     Add-Check "Time synchronization" "WARN" $_.Exception.Message
 }
 
-# Local service checks on machine running the script
-foreach ($serviceName in @("Netlogon", "Kdc", "W32Time", "Dnscache")) {
+# Local and remote service checks using WinRM / CIM fallback
+foreach ($dc in $DomainControllers) {
     try {
-        $service = Get-Service -Name $serviceName -ErrorAction Stop
-        $status = if ($service.Status -eq "Running") { "PASS" } else { "WARN" }
-        Add-Check "Local service: $serviceName" $status `
-            "Status=$($service.Status)" `
-            "Confirm service state is appropriate for this machine's role."
+        # Fast CIM query over WinRM (WS-Man)
+        $cimSessionOptions = New-CimSessionOption -Protocol Wsman -ConnectTimeoutMs 2000
+        $session = New-CimSession -ComputerName $dc -SessionOption $cimSessionOptions -ErrorAction Stop
+        
+        $adServices = Get-CimInstance -CimSession $session -ClassName Win32_Service -Filter "Name='NTDS' OR Name='DNS' OR Name='KDC' OR Name='Netlogon' OR Name='W32Time' OR Name='DFSR' OR Name='Dnscache' OR Name='ADWS'" -ErrorAction Stop
+        
+        foreach ($svc in $adServices) {
+            $svcStatus = if ($svc.State -eq 'Running') { "PASS" } else { "WARN" }
+            Add-Check "DC Service ($dc): $($svc.Name)" $svcStatus "State=$($svc.State)"
+        }
+        Remove-CimSession $session -ErrorAction SilentlyContinue
     } catch {
-        Add-Check "Local service: $serviceName" "INFO" `
-            "Service unavailable or not installed on this host."
+        # Invoke-Command over PowerShell Remoting
+        try {
+            $adServices = Invoke-Command -ComputerName $dc -ScriptBlock {
+                Get-Service -Name "NTDS", "DNS", "KDC", "Netlogon", "W32Time", "DFSR", "Dnscache", "ADWS" -ErrorAction SilentlyContinue
+            } -ConnectionUri "http://$dc`:5985/WSMAN" -ErrorAction Stop
+
+            foreach ($svc in $adServices) {
+                $svcStatus = if ($svc.Status -eq 'Running') { "PASS" } else { "WARN" }
+                Add-Check "DC Service ($dc): $($svc.Name)" $svcStatus "Status=$($svc.Status)"
+            }
+        } catch {
+            Add-Check "DC Service Check ($dc)" "WARN" "Failed to query services via WinRM/CIM: $($_.Exception.Message)" "Verify WinRM (TCP 5985) or RPC permissions on $dc."
+        }
     }
 }
 
@@ -110,6 +153,22 @@ if ($domain) {
     }
 }
 
+# OS servicing store health (DISM) 
+if ($IncludeDism) {
+    try {
+        $dismResult = & dism.exe /Online /Cleanup-Image /CheckHealth 2>&1
+        if ($LASTEXITCODE -eq 0 -and ($dismResult -match "No component store corruption detected")) {
+            Add-Check "OS Servicing Store (DISM)" "PASS" "Component store healthy."
+        } else {
+            Add-Check "OS Servicing Store (DISM)" "WARN" "Component store corruption detected or DISM error." "Run Dism /Online /Cleanup-Image /RestoreHealth."
+        }
+    } catch {
+        Add-Check "OS Servicing Store (DISM)" "WARN" $_.Exception.Message
+    }
+} else {
+    Add-Check "OS Servicing Store (DISM)" "SKIP" "DISM check skipped for performance. Run with -IncludeDism to enable."
+}
+
 # Domain controller reachability
 foreach ($dc in $DomainControllers) {
     if (Test-Connection -ComputerName $dc -Count 1 -Quiet) {
@@ -118,6 +177,31 @@ foreach ($dc in $DomainControllers) {
         Add-Check "DC reachability: $dc" "WARN" `
             "No ICMP response; ICMP may be blocked." `
             "Validate with DNS, LDAP, RPC, and event-log checks too."
+    }
+}
+
+# FSMO role owner reachability
+if ($domain) {
+    try {
+        $forest = Get-ADForest -ErrorAction Stop
+        $fsmoRoles = @{
+            "PDCEmulator"         = $domain.PDCEmulator
+            "RIDMaster"           = $domain.RIDMaster
+            "InfrastructureMaster"= $domain.InfrastructureMaster
+            "SchemaMaster"        = $forest.SchemaMaster
+            "DomainNamingMaster"  = $forest.DomainNamingMaster
+        }
+
+        foreach ($role in $fsmoRoles.Keys) {
+            $holder = $fsmoRoles[$role]
+            if (Test-Connection -ComputerName $holder -Count 1 -Quiet) {
+                Add-Check "FSMO Role: $role" "PASS" "Owner ($holder) is online."
+            } else {
+                Add-Check "FSMO Role: $role" "WARN" "Owner ($holder) is unreachable via ICMP." "Verify owner host state."
+            }
+        }
+    } catch {
+        Add-Check "FSMO Role Check" "WARN" $_.Exception.Message
     }
 }
 
@@ -139,6 +223,20 @@ if (Test-CommandAvailable "repadmin.exe") {
         "repadmin.exe not found." "Run on a machine with AD DS tools installed."
 }
 
+# ADWS and LDAP port checks
+$requiredPorts = @(53, 88, 389, 636, 3268, 9389)
+
+foreach ($dc in $DomainControllers) {
+    foreach ($port in $requiredPorts) {
+        $tcp = Test-NetConnection -ComputerName $dc -Port $port -WarningAction SilentlyContinue
+        if ($tcp.TcpTestSucceeded) {
+            Add-Check "Port Check ($dc:$port)" "PASS" "TCP Port $port open."
+        } else {
+            Add-Check "Port Check ($dc:$port)" "WARN" "TCP Port $port filtered or closed." "Check host firewalls and service states."
+        }
+    }
+}
+
 # DCDIAG
 if (Test-CommandAvailable "dcdiag.exe") {
     foreach ($dc in $DomainControllers) {
@@ -158,8 +256,8 @@ if (Test-CommandAvailable "dcdiag.exe") {
     Add-Check "DCDIAG" "SKIP" "dcdiag.exe not found."
 }
 
-# Current machine's security log checks recent high priority events
-    # You should still collect from every DC for a complete picture
+# Current machine's Security log: recent high-value event IDs.
+# This is not a substitute for collecting from every DC.
 try {
     $since = (Get-Date).AddHours(-$EventLookbackHours)
     $ids = @(1102, 4719, 4720, 4722, 4724, 4726, 4728, 4732, 4740, 4756, 5136)
