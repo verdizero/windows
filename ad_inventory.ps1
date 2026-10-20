@@ -1,26 +1,18 @@
 # Verifies Active Directory RSAT tools are installed and attempts to install them if not found
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+    Write-Host "Active Directory module not found. Installing RSAT..." -ForegroundColor Yellow
+    Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0 -ErrorAction Stop
+}
 
-param(
-    [string]$OutputRoot = ".\AD-Inventory-Reports",
-    [int]$StaleDays = 90
-)
+Import-Module ActiveDirectory -ErrorAction Stop
 
-# Collects an inventory of Active Directory objects and generates a report with findings
-
-Get-Module -ListAvailable ActiveDirectory
-
-Add-WindowsCapability -Online `
-  -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0
-
-
-$ErrorActionPreference = "Continue"
-
+# Attempt automatic domain query and falls back to explicit DC if needed
 try {
-    Import-Module ActiveDirectory -ErrorAction Stop
     $domain = Get-ADDomain -ErrorAction Stop
 } catch {
-    Write-Error "Cannot load AD module or query the domain: $_"
-    return
+    Write-Warning "Default ADWS discovery failed: $_"
+    $dcTarget = Read-Host "Enter the FQDN or IP of a target Domain Controller (e.g. dc01.domain.com)"
+    $domain = Get-ADDomain -Server $dcTarget -ErrorAction Stop
 }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
