@@ -205,7 +205,7 @@ foreach ($hostName in $ComputerName) {
 
 $checkpoints | ConvertTo-Json | Set-Content -LiteralPath $checkpointPath -Encoding UTF8
 
-# --- Polling Loop ---
+# Polling loop
 while ($true) {
     foreach ($hostName in $ComputerName) {
         try {
