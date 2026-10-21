@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "hashRules": [],
+  "taskRules": [],
+  "startupRules": [],
+  "notes": [
+    "Avoid treating heuristics as proof of compromise or definitive.",
+    "Add only verified SHA-256 hashes",
+    "Task paths and names must match exactly!!!!!",
+    "Startup registry keys and value names must match exactly!!!!!!!"
+  ]
+}
