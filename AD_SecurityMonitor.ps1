@@ -13,7 +13,7 @@
 param(
     [string[]]$ComputerName = @($env:COMPUTERNAME),
     [int]$PollSeconds = 10,
-    [string]$OutputRoot = ".\AD-SecurityMonitor",
+    [string]$OutputRoot = "$env.:USERPROFILE\AD-SecurityMonitor",
     [int]$FirstRunLookbackMinutes = 5,
     [switch]$IncludeInformational,
     [switch]$ConfigureLocalAuditPolicy

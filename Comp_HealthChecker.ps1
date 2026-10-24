@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$OutputRoot = ".\Competition-Health",
+    [string]$OutputRoot = "$env:USERPROFILE\AD-HealthCheck",
     [string[]]$DomainControllers = @(),
     [int]$EventLookbackHours = 24,
     [switch]$IncludeDism

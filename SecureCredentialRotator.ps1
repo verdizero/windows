@@ -217,15 +217,24 @@ function Get-AccountPolicy {
     param([string]$Identity)
 
     $user = Get-DirectoryUser -Identity $Identity
-    $policy = Get-ADUserResultantPasswordPolicy `
-        -Identity $user -Server $Server
+
+    if ($Server) {
+        $policy = Get-ADUserResultantPasswordPolicy `
+            -Identity $user -Server $Server -ErrorAction Stop
+    }
+    else {
+        $policy = Get-ADUserResultantPasswordPolicy `
+            -Identity $user -ErrorAction Stop
+    }
 
     if ($null -eq $policy) {
         if ($Server) {
-            $policy = Get-ADDefaultDomainPasswordPolicy -Server $Server
+            $policy = Get-ADDefaultDomainPasswordPolicy `
+                -Server $Server -ErrorAction Stop
         }
         else {
-            $policy = Get-ADDefaultDomainPasswordPolicy
+            $policy = Get-ADDefaultDomainPasswordPolicy `
+                -ErrorAction Stop
         }
     }
 
@@ -260,11 +269,13 @@ function New-SecurePassword {
         [int]$MinimumLength = 20
     )
 
-    if (-not [System.Security.Cryptography.RandomNumberGenerator]::GetMethod(
-        "GetInt32",
-        [type[]]@([int])
-    )) {
-        throw "Use Powershell 7.2+ for password generation"
+    if (-not [System.Security.Cryptography.RandomNumberGenerator].GetMethods() |
+        Where-Object {
+            $_.Name -eq 'GetInt32' -and
+            $_.GetParameters().Count -eq 1 -and
+            $_.GetParameters()[0].ParameterType -eq [int]
+        }) {
+        throw "Use PowerShell 7.2+ for password generation"
     }
 
     $upper   = "ABCDEFGHJKLMNPQRSTUVWXYZ".ToCharArray()
@@ -307,12 +318,10 @@ function New-SecurePassword {
     return -join $chars
 }
 
-# Guarded rotation
-
 function Invoke-Rotation {
     if (-not $Apply) {
-        Write-Host "PREVIEW ONLY. No password changes will be made."
-        Write-Host "Run with -Mode Rotate -Apply to enable per-account resets."
+        Write-Host "PREVIEW ONLY! No password changes will be made!"
+        Write-Host "Run with -Mode Rotate -Apply to enable per-account resets"
     }
 
     $registry = @(Get-Registry)
@@ -321,7 +330,6 @@ function Invoke-Rotation {
         throw "Registry is empty, enroll and review accounts first."
     }
 
-    # This workflow intentionally excludes service accounts.
     $targets = @($registry | Where-Object {
         $_.Category -eq "PrivilegedHuman"
     })
@@ -434,7 +442,6 @@ function Invoke-Rotation {
     Write-Host "Review the results log and verify every intended account."
 }
 
-# Entry point
 
 switch ($Mode) {
     "Inventory" {
