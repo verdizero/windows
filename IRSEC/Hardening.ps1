@@ -34,6 +34,11 @@ param(
     [string]$ConfigFile
 )
 
+if (-not $DryRun -and -not $InstallTools) {
+    Write-Warning 'No execution switch specified. Use -DryRun to audit or -InstallTools to run the toolkit.'
+    return
+}
+
 $ErrorActionPreference = 'Continue'
 
 $Config = [ordered]@{
