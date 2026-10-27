@@ -46,12 +46,19 @@ $SCTPath = "$env:SystemDrive\Tools\SecurityComplianceToolkit"
 New-Item -ItemType Directory -Force -Path $SCTPath
 Invoke-WebRequest -Uri "https://github.com/microsoft/SecurityComplianceToolkit/releases/latest/download/SecurityComplianceToolkit.zip" -OutFile "$SCTPath\SecurityComplianceToolkit.zip"
 Expand-Archive -Path "$SCTPath\SecurityComplianceToolkit.zip" -DestinationPath "$SCTPath\SecurityComplianceToolkit" -Force
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/microsoftarchive/New-KrbtgtKeys.ps1/master/New-KrbtgtKeys.ps1" -OutFile "$SCTPath\New-KrbtgtKeys.ps1"
+Unblock-File -Path "$SCTPath\New-KrbtgtKeys.ps1"
+
+    # test mode & "$SCTPath\New-KrbtgtKeys.ps1" -Test
+    # execute mode & "$SCTPath\New-KrbtgtKeys.ps1"
 
 winget install --id SpecterOps.BloodHound --silent --accept-package-agreements --accept-source-agreements
 $BloodHoundPath = "$env:SystemDrive\Tools\BloodHound"
 New-Item -ItemType Directory -Force -Path $BloodHoundPath
 Invoke-WebRequest -Uri "https://github.com/SpecterOps/Bloodhound/raw/main/Collectors/SharpHound.ps1" -OutFile "$BloodHoundPath\SharpHound.ps1"
+Unblock-File -Path "$BloodHoundPath\SharpHound.ps1"
 Invoke-WebRequest -Uri "https://github.com/SpecterOps/Bloodhound/raw/main/Collectors/SharpHound.exe" -OutFile "$BloodHoundPath\SharpHound.exe"
+Unblock-File -Path "$BloodHoundPath\SharpHound.exe"
 
 
 $Config = [ordered]@{
