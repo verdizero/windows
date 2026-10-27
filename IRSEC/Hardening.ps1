@@ -5,13 +5,15 @@
 .USAGE
   1. Fill in the config block below, OR leave it generic and make one small
      per-host file (see EXAMPLE CONFIG FILE at the bottom) and pass -ConfigFile
-  2. Pass -DryRun to only audit, not make changes:   .\Harden-Windows.ps1 -DryRun -ConfigFile .\web01.ps1
-  3. Review suggestions and then apply:    .\Harden-Windows.ps1 -ConfigFile .\web01.ps1
+  2. Pass -InstallTools to install Sysinternals, SCT, BloodHound, and SharpHound:
+     .\Harden-Windows.ps1 -InstallTools
+  3. Pass -DryRun to only audit, not make changes:   .\Harden-Windows.ps1 -DryRun -ConfigFile .\web01.ps1
+  4. Review suggestions and then apply:    .\Harden-Windows.ps1 -ConfigFile .\web01.ps1
   Run only some:            .\Harden-Windows.ps1 -Only Users,Firewall
   Skip some:                .\Harden-Windows.ps1 -Skip Services,Registry
 
   Modules (run in this order):
-    Backup, Recon, Users, PasswordPolicy, Firewall, Services, Registry, SMB,
+    Tools, Backup, Recon, Users, PasswordPolicy, Firewall, Services, Registry, SMB,
     Audit, Shares, RoleSpecific, Custom
 
   Everything --> $Config.BackupDir. Backup + Recon establish what's
@@ -26,40 +28,13 @@
 [CmdletBinding()]
 param(
     [switch]$DryRun,
+    [switch]$InstallTools,
     [string[]]$Only = @(),
     [string[]]$Skip = @(),
     [string]$ConfigFile
 )
 
 $ErrorActionPreference = 'Continue'
-
-# download tools (winget, Sysinternals, Security Compliance Toolkit, BloodHound)
-$WebClient = New-Object System.Net.WebClient
-#WebClient.DownloadFile("https://github.com/microsoft/winget-cli/releases/latest/download/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle", "$env:TEMP\winget.msixbundle")
-Add-AppxPackage -Path "$env:TEMP\winget.msixbundle"
-
-winget install --id Microsoft.Sysinternals.SysinternalsSuite --silent --accept-package-agreements --accept-source-agreements
-winget install --id Microsoft.Sysinternals.Sysinternals.Sysmon --silent --accept-package-agreements --accept-source-agreements
-Invoke-WebRequest -Uri  "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml" -OutFile "$env:TEMP\sysmonconfig.xml"
-sysmon64.exe -accepteula -i "$env:TEMP\sysmonconfig.xml"
-$SCTPath = "$env:SystemDrive\Tools\SecurityComplianceToolkit"
-New-Item -ItemType Directory -Force -Path $SCTPath
-Invoke-WebRequest -Uri "https://github.com/microsoft/SecurityComplianceToolkit/releases/latest/download/SecurityComplianceToolkit.zip" -OutFile "$SCTPath\SecurityComplianceToolkit.zip"
-Expand-Archive -Path "$SCTPath\SecurityComplianceToolkit.zip" -DestinationPath "$SCTPath\SecurityComplianceToolkit" -Force
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/microsoftarchive/New-KrbtgtKeys.ps1/master/New-KrbtgtKeys.ps1" -OutFile "$SCTPath\New-KrbtgtKeys.ps1"
-Unblock-File -Path "$SCTPath\New-KrbtgtKeys.ps1"
-
-    # test mode & "$SCTPath\New-KrbtgtKeys.ps1" -Test
-    # execute mode & "$SCTPath\New-KrbtgtKeys.ps1"
-
-winget install --id SpecterOps.BloodHound --silent --accept-package-agreements --accept-source-agreements
-$BloodHoundPath = "$env:SystemDrive\Tools\BloodHound"
-New-Item -ItemType Directory -Force -Path $BloodHoundPath
-Invoke-WebRequest -Uri "https://github.com/SpecterOps/Bloodhound/raw/main/Collectors/SharpHound.ps1" -OutFile "$BloodHoundPath\SharpHound.ps1"
-Unblock-File -Path "$BloodHoundPath\SharpHound.ps1"
-Invoke-WebRequest -Uri "https://github.com/SpecterOps/Bloodhound/raw/main/Collectors/SharpHound.exe" -OutFile "$BloodHoundPath\SharpHound.exe"
-Unblock-File -Path "$BloodHoundPath\SharpHound.exe"
-
 
 $Config = [ordered]@{
     HostLabel            = ''             # ex. 'web01', computername
@@ -176,8 +151,49 @@ if ($env:SESSIONNAME -like 'RDP-*' -and -not $Config.EnableRDP) {
     $Config.EnableRDP = $true
 }
 
-# shit to do
+# Tools installation module
+function Invoke-Tools {
+    if (-not $InstallTools -and -not ($Only -contains 'Tools')) {
+        return
+    }
 
+    Invoke-Step 'Install Winget dependencies' {
+        Add-AppxPackage -Path "$env:TEMP\winget.msixbundle"
+    }
+
+    Invoke-Step 'Install Sysinternals Suite via winget' {
+        winget install --id Microsoft.Sysinternals.SysinternalsSuite --silent --accept-package-agreements --accept-source-agreements
+    }
+
+    Invoke-Step 'Install Sysmon via winget and configure' {
+        winget install --id Microsoft.Sysinternals.Sysinternals.Sysmon --silent --accept-package-agreements --accept-source-agreements
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml" -OutFile "$env:TEMP\sysmonconfig.xml"
+        if (-not $DryRun) {
+            sysmon64.exe -accepteula -i "$env:TEMP\sysmonconfig.xml"
+        }
+    }
+
+    Invoke-Step 'Download and setup Security Compliance Toolkit' {
+        $SCTPath = "$env:SystemDrive\Tools\SecurityComplianceToolkit"
+        New-Item -ItemType Directory -Force -Path $SCTPath | Out-Null
+        Invoke-WebRequest -Uri "https://github.com/microsoft/SecurityComplianceToolkit/releases/latest/download/SecurityComplianceToolkit.zip" -OutFile "$SCTPath\SecurityComplianceToolkit.zip"
+        Expand-Archive -Path "$SCTPath\SecurityComplianceToolkit.zip" -DestinationPath "$SCTPath\SecurityComplianceToolkit" -Force
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/microsoftarchive/New-KrbtgtKeys.ps1/master/New-KrbtgtKeys.ps1" -OutFile "$SCTPath\New-KrbtgtKeys.ps1"
+        Unblock-File -Path "$SCTPath\New-KrbtgtKeys.ps1"
+    }
+
+    Invoke-Step 'Install BloodHound and SharpHound collectors' {
+        winget install --id SpecterOps.BloodHound --silent --accept-package-agreements --accept-source-agreements
+        $BloodHoundPath = "$env:SystemDrive\Tools\BloodHound"
+        New-Item -ItemType Directory -Force -Path $BloodHoundPath | Out-Null
+        Invoke-WebRequest -Uri "https://github.com/SpecterOps/Bloodhound/raw/main/Collectors/SharpHound.ps1" -OutFile "$BloodHoundPath\SharpHound.ps1"
+        Unblock-File -Path "$BloodHoundPath\SharpHound.ps1"
+        Invoke-WebRequest -Uri "https://github.com/SpecterOps/Bloodhound/raw/main/Collectors/SharpHound.exe" -OutFile "$BloodHoundPath\SharpHound.exe"
+        Unblock-File -Path "$BloodHoundPath\SharpHound.exe"
+    }
+}
+
+# Backup
 function Invoke-Backup {
     $b = Join-Path $Config.BackupDir "backup_$Stamp"
     $null = New-Item -ItemType Directory -Force -Path $b
@@ -612,8 +628,8 @@ function Invoke-Custom {
 }
 
 # RUNNER
-Write-Log "Host=$env:COMPUTERNAME Label=$($Config.HostLabel) Role=$($Config.Role) IsDC=$IsDC DryRun=$DryRun"
-$order = 'Backup','Recon','Users','PasswordPolicy','Firewall','Services','Registry','SMB','Defender','Audit','Shares','RoleSpecific','Custom'
+Write-Log "Host=$env:COMPUTERNAME Label=$($Config.HostLabel) Role=$($Config.Role) IsDC=$IsDC DryRun=$DryRun InstallTools=$InstallTools"
+$order = 'Tools','Backup','Recon','Users','PasswordPolicy','Firewall','Services','Registry','SMB','Defender','Audit','Shares','RoleSpecific','Custom'
 foreach ($m in $order) {
     if ($Only.Count -gt 0 -and $Only -notcontains $m) { continue }
     if ($Skip -contains $m) { continue }
