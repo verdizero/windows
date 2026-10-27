@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Windows hardening template
+  Windows Blue Team Hardening and Incident Response Installation Toolkit
 
 .USAGE
   1. Fill in the config block below, OR leave it generic and make one small
@@ -19,6 +19,9 @@
 
   !! Everything that commonly breaks scoring has a flag in config and is off by default
   !! Check your scoring requirements first if you have them (ik IRSEC doesn't probably)
+
+  After processes run, review the output and any changes made to ensure everything is as expected.
+  Double check all installed packages work via testing on virtual machines.
 #>
 [CmdletBinding()]
 param(
@@ -29,6 +32,27 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+
+# download tools (winget, Sysinternals, Security Compliance Toolkit, BloodHound)
+$WebClient = New-Object System.Net.WebClient
+#WebClient.DownloadFile("https://github.com/microsoft/winget-cli/releases/latest/download/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle", "$env:TEMP\winget.msixbundle")
+Add-AppxPackage -Path "$env:TEMP\winget.msixbundle"
+
+winget install --id Microsoft.Sysinternals.SysinternalsSuite --silent --accept-package-agreements --accept-source-agreements
+winget install --id Microsoft.Sysinternals.Sysinternals.Sysmon --silent --accept-package-agreements --accept-source-agreements
+Invoke-WebRequest -Uri  "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml" -OutFile "$env:TEMP\sysmonconfig.xml"
+sysmon64.exe -accepteula -i "$env:TEMP\sysmonconfig.xml"
+$SCTPath = "$env:SystemDrive\Tools\SecurityComplianceToolkit"
+New-Item -ItemType Directory -Force -Path $SCTPath
+Invoke-WebRequest -Uri "https://github.com/microsoft/SecurityComplianceToolkit/releases/latest/download/SecurityComplianceToolkit.zip" -OutFile "$SCTPath\SecurityComplianceToolkit.zip"
+Expand-Archive -Path "$SCTPath\SecurityComplianceToolkit.zip" -DestinationPath "$SCTPath\SecurityComplianceToolkit" -Force
+
+winget install --id SpecterOps.BloodHound --silent --accept-package-agreements --accept-source-agreements
+$BloodHoundPath = "$env:SystemDrive\Tools\BloodHound"
+New-Item -ItemType Directory -Force -Path $BloodHoundPath
+Invoke-WebRequest -Uri "https://github.com/SpecterOps/Bloodhound/raw/main/Collectors/SharpHound.ps1" -OutFile "$BloodHoundPath\SharpHound.ps1"
+Invoke-WebRequest -Uri "https://github.com/SpecterOps/Bloodhound/raw/main/Collectors/SharpHound.exe" -OutFile "$BloodHoundPath\SharpHound.exe"
+
 
 $Config = [ordered]@{
     HostLabel            = ''             # ex. 'web01', computername
