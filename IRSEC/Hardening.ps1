@@ -156,25 +156,20 @@ if ($env:SESSIONNAME -like 'RDP-*' -and -not $Config.EnableRDP) {
 }
 
 # Tools installation module
+# Portable across Windows 10/11 and Windows Server 2022/2025.
+# Does not require WinGet; downloads Sysinternals directly from Microsoft.
 function Invoke-Tools {
-    if (-not $InstallTools -and -not ($Only -contains 'Tools')) {
-        return
-    }
-
-    function Get-WinGetCommand {
-        $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
-        if (-not $cmd) { $cmd = Get-Command winget -ErrorAction SilentlyContinue }
-        if (-not $cmd) {
-            throw "WinGet is not installed / is not available to this user... Install/update Microsoft's App Installer, then reopen PowerShell. No nonexistent TEMP\winget.msixbundle is assumed"
-        }
-        return $cmd.Source
-    }
+    if (-not $InstallTools -and -not ($Only -contains 'Tools')) { return }
 
     function Invoke-CheckedNative {
-        param([string]$FilePath, [string[]]$Arguments)
+        param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @())
+        if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+            throw "Executable not found: $FilePath"
+        }
         & $FilePath @Arguments
-        if ($LASTEXITCODE -ne 0) {
-            throw "'$FilePath' failed with exit code $LASTEXITCODE"
+        $code = $LASTEXITCODE
+        if ($null -ne $code -and $code -ne 0) {
+            throw "'$FilePath' failed with exit code $code."
         }
     }
 
@@ -182,20 +177,20 @@ function Invoke-Tools {
         param(
             [Parameter(Mandatory)][string]$Uri,
             [Parameter(Mandatory)][string]$OutFile,
-            [int]$Attempts = 3
+            [int]$Attempts = 4,
+            [int]$TimeoutSec = 120
         )
         $parent = Split-Path -Parent $OutFile
         if ($parent -and -not (Test-Path -LiteralPath $parent)) {
-            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+            New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null
         }
         $lastError = $null
         for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
             try {
-                if (Test-Path -LiteralPath $OutFile) {
-                    Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
-                }
-                Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -TimeoutSec 90 -ErrorAction Stop
-                if (-not (Test-Path -LiteralPath $OutFile) -or (Get-Item -LiteralPath $OutFile).Length -lt 100) {
+                Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+                Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+                if (-not (Test-Path -LiteralPath $OutFile -PathType Leaf) -or
+                    (Get-Item -LiteralPath $OutFile).Length -lt 100) {
                     throw "Download was empty or suspiciously small: $Uri"
                 }
                 return
@@ -203,115 +198,128 @@ function Invoke-Tools {
             catch {
                 $lastError = $_
                 if ($attempt -lt $Attempts) {
-                    Start-Sleep -Seconds ([Math]::Min(2 * $attempt, 8))
+                    Write-Log "Download attempt $attempt/$Attempts failed for $Uri; retrying. $($_.Exception.Message)" 'WARN'
+                    Start-Sleep -Seconds ([Math]::Min(2 * $attempt, 10))
                 }
             }
         }
         throw "Download failed after $Attempts attempts: $Uri. $($lastError.Exception.Message)"
     }
 
-    $wingetPath = $null
-    Invoke-Step 'Check WinGet availability' {
-        $wingetPath = Get-WinGetCommand
-        Write-Log "Using WinGet at $wingetPath"
+    # Windows PowerShell 5.1 on older images may not negotiate modern HTTPS by default.
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch { Write-Log "Could not explicitly enable TLS 1.2: $($_.Exception.Message)" 'WARN' }
+
+    $toolRoot = Join-Path $env:ProgramData 'BlueTeamTools'
+    $downloadRoot = Join-Path $toolRoot 'Downloads'
+    $sysinternalsRoot = Join-Path $toolRoot 'Sysinternals'
+    $bloodHoundRoot = Join-Path $toolRoot 'BloodHound'
+    foreach ($dir in @($toolRoot, $downloadRoot, $sysinternalsRoot, $bloodHoundRoot)) {
+        New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
     }
 
-    if (-not $wingetPath) {
-        Write-Log 'Skipping package installs because WinGet is unavailable' 'WARN'
-        return
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        throw 'Tool installation requires an elevated PowerShell session - reopen powershell as Administrator and rerun -InstallTools'
     }
 
-    Invoke-Step 'Install Sysinternals Suite via WinGet' {
-        Invoke-CheckedNative -FilePath $wingetPath -Arguments @(
-            'install', '--id', 'Microsoft.Sysinternals.SysinternalsSuite', '--exact',
-            '--silent', '--accept-package-agreements', '--accept-source-agreements',
-            '--disable-interactivity'
-        )
-    }
-
-    Invoke-Step 'Install Sysmon and configure' {
-        Invoke-CheckedNative -FilePath $wingetPath -Arguments @(
-            'install', '--id', 'Microsoft.Sysinternals.Sysmon', '--exact',
-            '--silent', '--accept-package-agreements', '--accept-source-agreements',
-            '--disable-interactivity'
-        )
-
-        $sysmonPath = (Get-Command sysmon64.exe, sysmon.exe -ErrorAction SilentlyContinue |
-            Select-Object -First 1).Source
-        if (-not $sysmonPath) {
-            $candidatePaths = @(
-                "$env:ProgramFiles\SysinternalsSuite\Sysmon64.exe",
-                "$env:ProgramFiles\SysinternalsSuite\Sysmon.exe",
-                "$env:LOCALAPPDATA\Microsoft\WinGet\Links\Sysmon64.exe",
-                "$env:LOCALAPPDATA\Microsoft\WinGet\Links\Sysmon.exe"
-            )
-            foreach ($candidate in $candidatePaths) {
-                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                    $sysmonPath = $candidate
-                    break
-                }
+    Invoke-Step 'Download and extract Microsoft Sysinternals Suite' {
+        $suiteZip = Join-Path $downloadRoot 'SysinternalsSuite.zip'
+        $suiteUri = 'https://download.sysinternals.com/files/SysinternalsSuite.zip'
+        Invoke-DownloadWithRetry -Uri $suiteUri -OutFile $suiteZip
+        # Validate the archive before extracting it.
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($suiteZip)
+        try {
+            if (-not ($zip.Entries | Where-Object { $_.FullName -match '(?i)^Sysmon(?:64)?\.exe$' } | Select-Object -First 1)) {
+                throw 'Downloaded Sysinternals archive does not contain the expected Sysmon executable'
             }
+        } finally { $zip.Dispose() }
+        Expand-Archive -LiteralPath $suiteZip -DestinationPath $sysinternalsRoot -Force -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath (Join-Path $sysinternalsRoot 'Sysmon64.exe') -PathType Leaf) -and
+            -not (Test-Path -LiteralPath (Join-Path $sysinternalsRoot 'Sysmon.exe') -PathType Leaf)) {
+            throw "Sysmon executable was not found after extraction to $sysinternalsRoot"
         }
-        if (-not $sysmonPath) {
-            # Some WinGet installs are placed in package-specific directories.
-            $sysmonPath = (Get-ChildItem -Path "$env:ProgramFiles\WindowsApps" -Filter 'Sysmon64.exe' -File -Recurse -ErrorAction SilentlyContinue |
-                Select-Object -First 1).FullName
-        }
-        if (-not $sysmonPath) {
-            throw 'Sysmon installation reported success, but Sysmon64.exe could not be located. Check WinGet output and installed package files.'
-        }
+        Write-Log "Sysinternals Suite extracted to $sysinternalsRoot"
+    }
 
-        $configPath = Join-Path $env:TEMP 'sysmonconfig.xml'
+    Invoke-Step 'Install or update Sysmon with configuration' {
+        $sysmonPath = Join-Path $sysinternalsRoot 'Sysmon64.exe'
+        if (-not (Test-Path -LiteralPath $sysmonPath -PathType Leaf)) {
+            $sysmonPath = Join-Path $sysinternalsRoot 'Sysmon.exe'
+        }
+        if (-not (Test-Path -LiteralPath $sysmonPath -PathType Leaf)) {
+            throw "Sysmon executable is missing. Run the Sysinternals download step first: $sysinternalsRoot"
+        }
+        $configPath = Join-Path $toolRoot 'sysmonconfig.xml'
         Invoke-DownloadWithRetry -Uri 'https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml' -OutFile $configPath
         $null = [xml](Get-Content -LiteralPath $configPath -Raw -ErrorAction Stop)
-        Invoke-CheckedNative -FilePath $sysmonPath -Arguments @('-accepteula', '-i', $configPath)
+
+        $sysmonService = Get-Service -Name 'Sysmon64','Sysmon' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($sysmonService) {
+            Invoke-CheckedNative -FilePath $sysmonPath -Arguments @('-accepteula', '-c', $configPath)
+        } else {
+            Invoke-CheckedNative -FilePath $sysmonPath -Arguments @('-accepteula', '-i', $configPath)
+        }
+        $verifyService = Get-Service -Name 'Sysmon64','Sysmon' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $verifyService) { throw 'Sysmon command completed, but the Sysmon service could not be found.' }
+        Write-Log "Sysmon service detected: $($verifyService.Name) ($($verifyService.Status))"
     }
 
-    Invoke-Step 'Prepare Security Compliance Toolkit download' {
-        $SCTPath = Join-Path $env:SystemDrive 'Tools\SecurityComplianceToolkit'
-        New-Item -ItemType Directory -Force -Path $SCTPath | Out-Null
-        # Microsoft Download Center presents a selectable list of baseline/tool ZIPs;
-        # it does not provide a stable "latest toolkit ZIP" URL.
+    Invoke-Step 'Prepare Security Compliance Toolkit download instructions' {
+        $sctPath = Join-Path $toolRoot 'SecurityComplianceToolkit'
+        New-Item -ItemType Directory -Force -Path $sctPath -ErrorAction Stop | Out-Null
         $sctUrl = 'https://www.microsoft.com/en-us/download/details.aspx?id=55319'
-        Set-Content -LiteralPath (Join-Path $SCTPath 'DOWNLOAD-INSTRUCTIONS.txt') -Value @(
-            'Download the required baseline/tool ZIP from the official Microsoft Security Compliance Toolkit page:',
+        Set-Content -LiteralPath (Join-Path $sctPath 'DOWNLOAD-INSTRUCTIONS.txt') -Encoding UTF8 -Value @(
+            'Security Compliance Toolkit download instructions',
+            'Official Microsoft Download Center page:',
             $sctUrl,
             '',
-            'Select the baseline or tool appropriate for this operating system, download it, and extract it into this folder.'
-        ) -Encoding UTF8
-        Write-Log "SCT download page: $sctUrl"
+            'The download center offers separate files/baselines --> select the baseline matching this operating system, download, and extract into this folder.',
+            'This step intentionally does not guess a version-specific asset URL or report the toolkit as installed.'
+        ) -ErrorAction Stop
+        Write-Log "SCT instructions written to $sctPath"
+        Write-Log 'Security Compliance Toolkit requires selecting the appropriate Microsoft baseline download!' 'WARN'
     }
 
     Invoke-Step 'Download SharpHound collector from official release' {
-        $BloodHoundPath = Join-Path $env:SystemDrive 'Tools\BloodHound'
-        New-Item -ItemType Directory -Force -Path $BloodHoundPath | Out-Null
-
-        # Resolve a real release asset rather than requesting .exe/.ps1 files from a
-        # repository's source tree, where those filenames are not guaranteed to exist.
         $releaseUri = 'https://api.github.com/repos/SpecterOps/SharpHound/releases/latest'
-        $release = Invoke-RestMethod -Uri $releaseUri -Headers @{
-            'User-Agent' = 'Windows-Hardening-Toolkit'
-            'Accept' = 'application/vnd.github+json'
-        } -TimeoutSec 60 -ErrorAction Stop
-        $asset = $release.assets |
-            Where-Object { $_.name -match '(?i)\.zip$' -and $_.name -match '(?i)SharpHound' } |
-            Select-Object -First 1
+        $release = $null
+        $lastApiError = $null
+        for ($attempt = 1; $attempt -le 4; $attempt++) {
+            try {
+                $release = Invoke-RestMethod -Uri $releaseUri -Headers @{
+                    'User-Agent' = 'Windows-Hardening-Toolkit'
+                    'Accept' = 'application/vnd.github+json'
+                } -TimeoutSec 60 -ErrorAction Stop
+                break
+            } catch {
+                $lastApiError = $_
+                if ($attempt -lt 4) { Start-Sleep -Seconds ([Math]::Min(2 * $attempt, 10)) }
+            }
+        }
+        if (-not $release) { throw "Unable to query the official SharpHound release API. $($lastApiError.Exception.Message)" }
+        $asset = $release.assets | Where-Object {
+            $_.name -match '(?i)\.zip$' -and $_.name -match '(?i)SharpHound'
+        } | Select-Object -First 1
         if (-not $asset) {
             throw "Latest SharpHound release '$($release.tag_name)' did not expose a matching ZIP asset. Review https://github.com/SpecterOps/SharpHound/releases."
         }
-
-        $zipPath = Join-Path $BloodHoundPath $asset.name
+        $zipPath = Join-Path $downloadRoot $asset.name
         Invoke-DownloadWithRetry -Uri $asset.browser_download_url -OutFile $zipPath
-        $extractPath = Join-Path $BloodHoundPath 'SharpHound'
-        New-Item -ItemType Directory -Force -Path $extractPath | Out-Null
+        $extractPath = Join-Path $bloodHoundRoot 'SharpHound'
+        New-Item -ItemType Directory -Force -Path $extractPath -ErrorAction Stop | Out-Null
         Expand-Archive -LiteralPath $zipPath -DestinationPath $extractPath -Force -ErrorAction Stop
-        if (-not (Get-ChildItem -LiteralPath $extractPath -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^SharpHound(\.exe|\.ps1|\.dll)?$' } |
-            Select-Object -First 1)) {
+        $collector = Get-ChildItem -LiteralPath $extractPath -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^SharpHound(\.exe|\.ps1|\.dll)?$' } | Select-Object -First 1
+        if (-not $collector) {
             throw "Downloaded release ZIP did not contain an expected SharpHound collector file. Inspect: $extractPath"
         }
-        Get-ChildItem -LiteralPath $extractPath -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath $extractPath -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
         Write-Log "SharpHound collector extracted to $extractPath"
+        Write-Log 'This installs the SharpHound collector only, not the BloodHound server.' 'WARN'
     }
 }
 
