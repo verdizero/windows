@@ -156,171 +156,75 @@ if ($env:SESSIONNAME -like 'RDP-*' -and -not $Config.EnableRDP) {
 }
 
 # Tools installation module
-# Portable across Windows 10/11 and Windows Server 2022/2025.
-# Does not require WinGet; downloads Sysinternals directly from Microsoft.
 function Invoke-Tools {
     if (-not $InstallTools -and -not ($Only -contains 'Tools')) { return }
-
-    function Invoke-CheckedNative {
-        param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @())
-        if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
-            throw "Executable not found: $FilePath"
-        }
-        & $FilePath @Arguments
-        $code = $LASTEXITCODE
-        if ($null -ne $code -and $code -ne 0) {
-            throw "'$FilePath' failed with exit code $code."
-        }
-    }
-
-    function Invoke-DownloadWithRetry {
-        param(
-            [Parameter(Mandatory)][string]$Uri,
-            [Parameter(Mandatory)][string]$OutFile,
-            [int]$Attempts = 4,
-            [int]$TimeoutSec = 120
-        )
-        $parent = Split-Path -Parent $OutFile
-        if ($parent -and -not (Test-Path -LiteralPath $parent)) {
-            New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null
-        }
-        $lastError = $null
-        for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-            try {
-                Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
-                Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
-                if (-not (Test-Path -LiteralPath $OutFile -PathType Leaf) -or
-                    (Get-Item -LiteralPath $OutFile).Length -lt 100) {
-                    throw "Download was empty or suspiciously small: $Uri"
-                }
-                return
-            }
-            catch {
-                $lastError = $_
-                if ($attempt -lt $Attempts) {
-                    Write-Log "Download attempt $attempt/$Attempts failed for $Uri; retrying. $($_.Exception.Message)" 'WARN'
-                    Start-Sleep -Seconds ([Math]::Min(2 * $attempt, 10))
-                }
-            }
-        }
-        throw "Download failed after $Attempts attempts: $Uri. $($lastError.Exception.Message)"
-    }
-
-    # Windows PowerShell 5.1 on older images may not negotiate modern HTTPS by default.
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    } catch { Write-Log "Could not explicitly enable TLS 1.2: $($_.Exception.Message)" 'WARN' }
-
-    $toolRoot = Join-Path $env:ProgramData 'BlueTeamTools'
-    $downloadRoot = Join-Path $toolRoot 'Downloads'
-    $sysinternalsRoot = Join-Path $toolRoot 'Sysinternals'
-    $bloodHoundRoot = Join-Path $toolRoot 'BloodHound'
-    foreach ($dir in @($toolRoot, $downloadRoot, $sysinternalsRoot, $bloodHoundRoot)) {
-        New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
-    }
 
     $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
-        throw 'Tool installation requires an elevated PowerShell session - reopen powershell as Administrator and rerun -InstallTools'
+        throw 'Tool installation requires an elevated PowerShell session - reopen PowerShell as Administrator and rerun -InstallTools'
     }
 
-    Invoke-Step 'Download and extract Microsoft Sysinternals Suite' {
-        $suiteZip = Join-Path $downloadRoot 'SysinternalsSuite.zip'
-        $suiteUri = 'https://download.sysinternals.com/files/SysinternalsSuite.zip'
-        Invoke-DownloadWithRetry -Uri $suiteUri -OutFile $suiteZip
-        # Validate the archive before extracting it.
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($suiteZip)
-        try {
-            if (-not ($zip.Entries | Where-Object { $_.FullName -match '(?i)^Sysmon(?:64)?\.exe$' } | Select-Object -First 1)) {
-                throw 'Downloaded Sysinternals archive does not contain the expected Sysmon executable'
+    if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
+        Invoke-Step 'Install Chocolatey package manager' {
+            try {
+                [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            } catch {}
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            $installScript = Join-Path $env:TEMP 'install-chocolatey.ps1'
+            Invoke-WebRequest -Uri 'https://community.chocolatey.org/install.ps1' -OutFile $installScript -UseBasicParsing -ErrorAction Stop
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installScript
+            if ($LASTEXITCODE -ne 0) { throw "Chocolatey bootstrap failed with exit code $LASTEXITCODE" }
+            Remove-Item -LiteralPath $installScript -Force -ErrorAction SilentlyContinue
+            $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                        [Environment]::GetEnvironmentVariable('Path', 'User')
+            if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
+                $chocoExe = Join-Path $env:ProgramData 'chocolatey\bin\choco.exe'
+                if (Test-Path -LiteralPath $chocoExe) { $script:ChocolateyExe = $chocoExe }
+                else { throw 'Chocolatey installation completed but choco.exe was not found!' }
             }
-        } finally { $zip.Dispose() }
-        Expand-Archive -LiteralPath $suiteZip -DestinationPath $sysinternalsRoot -Force -ErrorAction Stop
-        if (-not (Test-Path -LiteralPath (Join-Path $sysinternalsRoot 'Sysmon64.exe') -PathType Leaf) -and
-            -not (Test-Path -LiteralPath (Join-Path $sysinternalsRoot 'Sysmon.exe') -PathType Leaf)) {
-            throw "Sysmon executable was not found after extraction to $sysinternalsRoot"
         }
-        Write-Log "Sysinternals Suite extracted to $sysinternalsRoot"
     }
 
-    Invoke-Step 'Install or update Sysmon with configuration' {
-        $sysmonPath = Join-Path $sysinternalsRoot 'Sysmon64.exe'
-        if (-not (Test-Path -LiteralPath $sysmonPath -PathType Leaf)) {
-            $sysmonPath = Join-Path $sysinternalsRoot 'Sysmon.exe'
-        }
-        if (-not (Test-Path -LiteralPath $sysmonPath -PathType Leaf)) {
-            throw "Sysmon executable is missing. Run the Sysinternals download step first: $sysinternalsRoot"
-        }
-        $configPath = Join-Path $toolRoot 'sysmonconfig.xml'
-        Invoke-DownloadWithRetry -Uri 'https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml' -OutFile $configPath
-        $null = [xml](Get-Content -LiteralPath $configPath -Raw -ErrorAction Stop)
+    $chocoExe = if ($script:ChocolateyExe) { $script:ChocolateyExe } else {
+        (Get-Command choco.exe -ErrorAction Stop).Source
+    }
 
-        $sysmonService = Get-Service -Name 'Sysmon64','Sysmon' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($sysmonService) {
-            Invoke-CheckedNative -FilePath $sysmonPath -Arguments @('-accepteula', '-c', $configPath)
-        } else {
-            Invoke-CheckedNative -FilePath $sysmonPath -Arguments @('-accepteula', '-i', $configPath)
+    $packages = @(
+        @{ Id = 'sysinternals'; Label = 'Microsoft Sysinternals Suite' },
+        @{ Id = 'sysmon';       Label = 'Sysmon' },
+        @{ Id = 'everything';   Label = 'Voidtools Everything' },
+        @{ Id = 'datadog-agent'; Label = 'Datadog Agent' }
+    )
+
+    foreach ($pkg in $packages) {
+        Invoke-Step "Install/update $($pkg.Label) via Chocolatey ($($pkg.Id))" {
+            & $chocoExe upgrade $pkg.Id -y --no-progress
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -notin @(0, 3010)) {
+                throw "Chocolatey package '$($pkg.Id)' failed with exit code $exitCode."
+            }
+            if ($exitCode -eq 3010) { Write-Log "$($pkg.Label) installed; a reboot may be required." 'WARN' }
         }
-        $verifyService = Get-Service -Name 'Sysmon64','Sysmon' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $verifyService) { throw 'Sysmon command completed, but the Sysmon service could not be found.' }
-        Write-Log "Sysmon service detected: $($verifyService.Name) ($($verifyService.Status))"
     }
 
     Invoke-Step 'Prepare Security Compliance Toolkit download instructions' {
+        $toolRoot = Join-Path $env:ProgramData 'BlueTeamTools'
         $sctPath = Join-Path $toolRoot 'SecurityComplianceToolkit'
         New-Item -ItemType Directory -Force -Path $sctPath -ErrorAction Stop | Out-Null
         $sctUrl = 'https://www.microsoft.com/en-us/download/details.aspx?id=55319'
         Set-Content -LiteralPath (Join-Path $sctPath 'DOWNLOAD-INSTRUCTIONS.txt') -Encoding UTF8 -Value @(
-            'Security Compliance Toolkit download instructions',
-            'Official Microsoft Download Center page:',
+            'Security compliance toolkit download instructions',
+            'Official Microsoft download center page:',
             $sctUrl,
             '',
-            'The download center offers separate files/baselines --> select the baseline matching this operating system, download, and extract into this folder.',
-            'This step intentionally does not guess a version-specific asset URL or report the toolkit as installed.'
+            'Select and download the baseline matching this operating system, then extract it into this folder.',
+            'No verified chocolatey package is configured for this toolkit.'
         ) -ErrorAction Stop
         Write-Log "SCT instructions written to $sctPath"
-        Write-Log 'Security Compliance Toolkit requires selecting the appropriate Microsoft baseline download!' 'WARN'
     }
 
-    Invoke-Step 'Download SharpHound collector from official release' {
-        $releaseUri = 'https://api.github.com/repos/SpecterOps/SharpHound/releases/latest'
-        $release = $null
-        $lastApiError = $null
-        for ($attempt = 1; $attempt -le 4; $attempt++) {
-            try {
-                $release = Invoke-RestMethod -Uri $releaseUri -Headers @{
-                    'User-Agent' = 'Windows-Hardening-Toolkit'
-                    'Accept' = 'application/vnd.github+json'
-                } -TimeoutSec 60 -ErrorAction Stop
-                break
-            } catch {
-                $lastApiError = $_
-                if ($attempt -lt 4) { Start-Sleep -Seconds ([Math]::Min(2 * $attempt, 10)) }
-            }
-        }
-        if (-not $release) { throw "Unable to query the official SharpHound release API. $($lastApiError.Exception.Message)" }
-        $asset = $release.assets | Where-Object {
-            $_.name -match '(?i)\.zip$' -and $_.name -match '(?i)SharpHound'
-        } | Select-Object -First 1
-        if (-not $asset) {
-            throw "Latest SharpHound release '$($release.tag_name)' did not expose a matching ZIP asset. Review https://github.com/SpecterOps/SharpHound/releases."
-        }
-        $zipPath = Join-Path $downloadRoot $asset.name
-        Invoke-DownloadWithRetry -Uri $asset.browser_download_url -OutFile $zipPath
-        $extractPath = Join-Path $bloodHoundRoot 'SharpHound'
-        New-Item -ItemType Directory -Force -Path $extractPath -ErrorAction Stop | Out-Null
-        Expand-Archive -LiteralPath $zipPath -DestinationPath $extractPath -Force -ErrorAction Stop
-        $collector = Get-ChildItem -LiteralPath $extractPath -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^SharpHound(\.exe|\.ps1|\.dll)?$' } | Select-Object -First 1
-        if (-not $collector) {
-            throw "Downloaded release ZIP did not contain an expected SharpHound collector file. Inspect: $extractPath"
-        }
-        Get-ChildItem -LiteralPath $extractPath -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
-        Write-Log "SharpHound collector extracted to $extractPath"
-        Write-Log 'This installs the SharpHound collector only, not the BloodHound server.' 'WARN'
-    }
+    Write-Log 'All done! (configure Datadog w/ API key and desired site/integrations before telemetry)' 'WARN'
 }
 
 # Backup
