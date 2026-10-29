@@ -7,12 +7,12 @@
      per-host file (see EXAMPLE CONFIG FILE at the bottom) and pass -ConfigFile
   2. Pass -InstallTools to install Sysinternals, SCT, BloodHound, and SharpHound:
      .\Harden-Windows.ps1 -InstallTools
-  3. Pass -DryRun to only audit, not make changes:   .\Harden-Windows.ps1 -DryRun -ConfigFile .\web01.ps1
-  4. Review suggestions and then apply:    .\Harden-Windows.ps1 -ConfigFile .\web01.ps1
-  Run only some:            .\Harden-Windows.ps1 -Only Users,Firewall
-  Skip some:                .\Harden-Windows.ps1 -Skip Services,Registry
+  3. Pass -DryRun to only audit, not make changes:   .\Hardening.ps1 -DryRun -ConfigFile .\web01.ps1
+  4. Review suggestions and then apply:    .\Hardening.ps1 -ConfigFile .\web01.ps1
+  Run only some:            .\Hardening.ps1 -Only Users,Firewall
+  Skip some:                .\Hardening.ps1 -Skip Services,Registry
 
-  Modules (run in this order):
+  Ordered Modules:
     Tools, Backup, Recon, Users, PasswordPolicy, Firewall, Services, Registry, SMB,
     Audit, Shares, RoleSpecific, Custom
 
@@ -42,15 +42,15 @@ if (-not $DryRun -and -not $InstallTools) {
 $ErrorActionPreference = 'Continue'
 
 $Config = [ordered]@{
-    HostLabel            = ''             # ex. 'web01', computername
+    HostLabel            = ''             
     Role                 = 'Workstation'  # DC | Web (IIS) | DNS | FTP | File | Mail | Workstation
 
-    # Accounts --> case-insensitive, SamAccountName or local username only
+    # case-insensitive, SamAccountName or local username only
     AuthorizedAdmins     = @('principal', 'sportingdir', 'chiefeng', 'strategist', 'scrutineer', 'techdirector', 'crewchief', 'firecrew')
     AuthorizedUsers      = @('pitcrew', 'mechanic', 'analyst', 'driver', 'tireman', 'jackcrew', 'garagecrew', 'celebrity', 'pitlaner', 'reserve', 'gunners')
     ProtectedAccounts    = @('whiteteam')
-    RDPUsers             = @()            # allowed in "Remote Desktop Users" (empty = don't touch group)
-    PasswordMode         = 'Prompt'       # Random = unique pw per account -> CSV | Prompt = one pw for all | None
+    RDPUsers             = @()            # allowed in "remote desktop users"
+    PasswordMode         = 'Prompt'       # random = unique pw per account -> CSV, prompt = one pw for all, or none
 
     # Services / network 
     ScoredServices       = @()            # service short names like 'W3SVC','DNS','MSSQLSERVER.' look up short name and tailor to computer
@@ -59,18 +59,18 @@ $Config = [ordered]@{
     UseRoleDefaultPorts  = $false         # also open typical ports for $Role
     AllowPing            = $false         # scoring often uses ICMP, but only on one workstation
     ScoringEngineIPs     = @()            # if set, scored ports are limited to these + TrustedIPs
-    TrustedIPs           = @('192.168.15.1', '192.168.15.2', '10.15.1.1', '10.15.1.2', '10.15.1.3', '10.15.1.254', '172.20.1.15')            # your team, limits RDP/WinRM when set
-    EnableRDP            = $false         # $true if RDP
-    EnableWinRM          = $false         # $true if WinRM/PSRemoting
-    ResetFirewallFirst   = $false         # wipe firewall to defaults before applying rules
+    TrustedIPs           = @('192.168.15.1', '192.168.15.2', '10.15.1.1', '10.15.1.2', '10.15.1.3', '10.15.1.254', '172.20.1.15')
+    EnableRDP            = $false         
+    EnableWinRM          = $false         
+    ResetFirewallFirst   = $false
 
     # Things that can break scoring
-    DisableSpooler       = $true          # print spooler (PrintNightmare). Set $false on print servers
+    DisableSpooler       = $true          # set false on print servers
     RequireSMBSigning    = $true          # true breaks some old/Samba clients
-    LmCompatibilityLevel = 4              # 5 = NTLMv2 only (strongest, may break legacy clients)
+    LmCompatibilityLevel = 4              # 5 = NTLMv2 only 
     DisableNetBIOS       = $false
     RequireLdapSigning   = $false         # DC only, true breaks simple/unsigned LDAP binds
-    RemoveUnlistedShares = $false         # $true deletes non-default shares not in AllowedShares
+    RemoveUnlistedShares = $false         # true deletes non-default shares not in AllowedShares
     AllowedShares        = @()            # share names to keep
 
     ServicesToDisable    = @('TlntSvr','RemoteRegistry','SNMP','SSDPSRV','upnphost','WebClient',
@@ -194,7 +194,6 @@ function Invoke-Tools {
         @{ Id = 'sysinternals'; Label = 'Microsoft Sysinternals Suite' },
         @{ Id = 'sysmon';       Label = 'Sysmon' },
         @{ Id = 'everything';   Label = 'Voidtools Everything' },
-        @{ Id = 'datadog-agent'; Label = 'Datadog Agent' }
     )
 
     foreach ($pkg in $packages) {
@@ -224,7 +223,7 @@ function Invoke-Tools {
         Write-Log "SCT instructions written to $sctPath"
     }
 
-    Write-Log 'All done! (configure Datadog w/ API key and desired site/integrations before telemetry)' 'WARN'
+    Write-Log 'All done!' 'WARN'
 }
 
 # Backup
@@ -514,7 +513,7 @@ function Invoke-Services {
             }
         }
     }
-    # Keep scored services up: automatic start + restart on failure
+    
     foreach ($s in $Config.ScoredServices) {
         if (-not (Get-Service -Name $s -ErrorAction SilentlyContinue)) { Write-Log "Scored service '$s' not found on this host" 'WARN'; continue }
         Invoke-Step "Scored service $s -> Automatic, running, auto-restart" {
