@@ -86,7 +86,7 @@ $Config = [ordered]@{
 }
 
 <# EXAMPLE CONFIG FILE
-# Save as web01.ps1 and run:  .\Harden-Windows.ps1 -ConfigFile .\web01.ps1 -DryRun
+# Save as web01.ps1 and run:  .\Hardening.ps1 -ConfigFile .\web01.ps1 -DryRun
 
 $Config.HostLabel         = 'web01'
 $Config.Role              = 'Web'
@@ -193,7 +193,7 @@ function Invoke-Tools {
     $packages = @(
         @{ Id = 'sysinternals'; Label = 'Microsoft Sysinternals Suite' },
         @{ Id = 'sysmon';       Label = 'Sysmon' },
-        @{ Id = 'everything';   Label = 'Voidtools Everything' },
+        @{ Id = 'everything';   Label = 'Voidtools Everything' }
     )
 
     foreach ($pkg in $packages) {
