@@ -56,7 +56,7 @@ $Config = [ordered]@{
     ScoredServices       = @()            # service short names like 'W3SVC','DNS','MSSQLSERVER.' look up short name and tailor to computer
     AllowedInboundTCP    = @()            # ex. 80,443  (ranges ok: '49152-65535')
     AllowedInboundUDP    = @()            # ex. 53
-    UseRoleDefaultPorts  = $false         # also open typical ports for $Role
+    UseRoleDefaultPorts  = $true        # also open typical ports for $Role
     AllowPing            = $false         # scoring often uses ICMP, but only on one workstation
     ScoringEngineIPs     = @()            # if set, scored ports are limited to these + TrustedIPs
     TrustedIPs           = @('192.168.15.1', '192.168.15.2', '10.15.1.1', '10.15.1.2', '10.15.1.3', '10.15.1.254', '172.20.1.15')
@@ -69,8 +69,8 @@ $Config = [ordered]@{
     RequireSMBSigning    = $true          # true breaks some old/Samba clients
     LmCompatibilityLevel = 4              # 5 = NTLMv2 only 
     DisableNetBIOS       = $false
-    RequireLdapSigning   = $false         # DC only, true breaks simple/unsigned LDAP binds
-    RemoveUnlistedShares = $false         # true deletes non-default shares not in AllowedShares
+    RequireLdapSigning   = $true         # DC only, true breaks simple/unsigned LDAP binds
+    RemoveUnlistedShares = $true         # true deletes non-default shares not in AllowedShares
     AllowedShares        = @()            # share names to keep
 
     ServicesToDisable    = @('TlntSvr','RemoteRegistry','SNMP','SSDPSRV','upnphost','WebClient',
