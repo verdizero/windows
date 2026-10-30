@@ -557,12 +557,12 @@ function Set-AccountPassword {
             if (-not $DryRun) { $PwRows.Add([pscustomobject]@{ Host = $env:COMPUTERNAME; User = $Name; Password = $plain }) }
         }
         default {
-            Write-Log "Unknown PasswordMode '$($Config.PasswordMode)' - skipping password reset for $Name" 'WARN'
+            Write-Log "Unknown PasswordMode '$($Config.PasswordMode)' + skipping password reset for $Name" 'WARN'
             return
         }
     }
     if (-not $sec) {
-        Write-Log "No password material for $Name (Prompt value missing?) - skip reset" 'WARN'
+        Write-Log "No password material for $Name (Prompt value missing?) + skip reset" 'WARN'
         return
     }
     Invoke-Step "Reset password for $Name ($($Config.PasswordMode))" {
@@ -576,7 +576,7 @@ function Invoke-Users {
     $protected = @($Config.ProtectedAccounts + $env:USERNAME + 'krbtgt' + 'DefaultAccount' + 'WDAGUtilityAccount') | Where-Object { $_ }
 
     if ($auth.Count -eq 0) {
-        Write-Log 'AuthorizedAdmins/AuthorizedUsers are empty - skipping Users module so we do not disable everyone.' 'WARN'
+        Write-Log 'AuthorizedAdmins/AuthorizedUsers are empty, so skipping users module so we do not disable everyone' 'WARN'
         return
     }
     if ($Config.PasswordMode -eq 'Prompt' -and -not $DryRun) {
@@ -654,7 +654,7 @@ function Invoke-Users {
         }
     }
 
-    Write-Log 'Account Enabled status after Users module (this is the live check, not the earlier recon dump):'
+    Write-Log 'Account Enabled status after Users module:'
     try {
         if ($IsDC) {
             Get-ADUser -Filter * -Properties Enabled, SamAccountName | Sort-Object SamAccountName | ForEach-Object {
