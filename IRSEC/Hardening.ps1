@@ -66,7 +66,7 @@ $Config = [ordered]@{
     AuthorizedUsers      = @('pitcrew', 'mechanic', 'analyst', 'driver', 'tireman', 'jackcrew', 'garagecrew', 'celebrity', 'pitlaner', 'reserve', 'gunners', 'whiteteam')
     ProtectedAccounts    = @('whiteteam', 'Administrator')
     RDPUsers             = @()            
-    PasswordMode         = 'Prompt'       # random = unique pw per account into csv, prompt = one pw for all, None
+    PasswordMode         = 'Prompt'       # Random = unique pw per account into csv, Prompt = one pw for all, None
 
     # Services / network
     ScoredServices       = @()            # service short names like 'W3SVC','DNS','MSSQLSERVER'. look up short name and tailor to computer
@@ -151,10 +151,28 @@ function Write-Log {
 }
 
 function Invoke-Step {
-    param([string]$Desc, [scriptblock]$Action)
+    param(
+        [string]$Desc,
+        [scriptblock]$Action,
+        [int[]]$SuccessExitCodes
+    )
     if ($DryRun) { Write-Log $Desc 'DRY'; return }
-    try   { & $Action; Write-Log $Desc 'OK' }
-    catch { Write-Log "$Desc :: $($_.Exception.Message)" 'ERROR' }
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Stop'
+    try {
+        & $Action
+        if ($PSBoundParameters.ContainsKey('SuccessExitCodes')) {
+            $code = Get-NativeExitCode
+            if ($code -notin @($SuccessExitCodes)) {
+                throw "Native command failed with exit code $code"
+            }
+        }
+        Write-Log $Desc 'OK'
+    } catch {
+        Write-Log "$Desc :: $($_.Exception.Message)" 'ERROR'
+    } finally {
+        $ErrorActionPreference = $oldEap
+    }
 }
 
 function Test-NameInList {
@@ -172,6 +190,118 @@ function ConvertTo-UniquePortList {
         Where-Object { $null -ne $_ -and "$_".Trim() -ne '' } |
         ForEach-Object { "$_".Trim() } |
         Select-Object -Unique
+}
+
+function Get-AccountSidString {
+    param($Account)
+    if ($null -eq $Account) { return $null }
+    $sid = $null
+    try { $sid = $Account.SID } catch { return $null }
+    if ($null -eq $sid) { return $null }
+    if ($sid -is [System.Security.Principal.SecurityIdentifier]) { return $sid.Value }
+    try { return ([System.Security.Principal.SecurityIdentifier]$sid).Value } catch { return "$sid" }
+}
+
+function Test-IsProtectedAccount {
+    param([string]$Name, $Account, [string[]]$ProtectedNames)
+    if (Test-NameInList -Name $Name -List $ProtectedNames) { return $true }
+    $sid = Get-AccountSidString -Account $Account
+    # Built-in Administrator is RID 500 even if the account was renamed.
+    if ($sid -and $sid -match '-500$') { return $true }
+    return $false
+}
+
+function Get-LocalAccountEnabled {
+    param([string]$Name)
+    $u = Get-LocalUser -Name $Name -ErrorAction Stop
+    return [bool]$u.Enabled
+}
+
+function Get-AdAccountEnabled {
+    param([string]$Name)
+    $u = Get-ADUser -Identity $Name -Properties Enabled -ErrorAction Stop
+    return [bool]$u.Enabled
+}
+
+function Set-AccountEnabledState {
+    param([string]$Name, [bool]$Enabled)
+    if ($IsDC) {
+        if ($Enabled) { Enable-ADAccount -Identity $Name -ErrorAction Stop }
+        else { Disable-ADAccount -Identity $Name -ErrorAction Stop }
+        $actual = Get-AdAccountEnabled -Name $Name
+    } else {
+        if ($Enabled) { Enable-LocalUser -Name $Name -ErrorAction Stop }
+        else { Disable-LocalUser -Name $Name -ErrorAction Stop }
+        $actual = Get-LocalAccountEnabled -Name $Name
+    }
+    if ($actual -ne $Enabled) {
+        throw "$Name is still Enabled=$actual (wanted Enabled=$Enabled)"
+    }
+}
+
+function Disable-OsFeature {
+    param(
+        [string[]]$OptionalFeatureNames = @(),
+        [string[]]$ServerFeatureNames = @()
+    )
+    $changed = $false
+    foreach ($name in $OptionalFeatureNames) {
+        $feat = Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction SilentlyContinue
+        if ($feat -and $feat.State -eq 'Enabled') {
+            Disable-WindowsOptionalFeature -Online -FeatureName $name -NoRestart -ErrorAction Stop | Out-Null
+            $changed = $true
+        }
+    }
+    $uninstall = Get-Command Uninstall-WindowsFeature -ErrorAction SilentlyContinue
+    if (-not $uninstall) {
+        try {
+            Import-Module ServerManager -ErrorAction Stop
+            $uninstall = Get-Command Uninstall-WindowsFeature -ErrorAction SilentlyContinue
+        } catch {}
+    }
+    if ($uninstall) {
+        foreach ($name in $ServerFeatureNames) {
+            $feat = Get-WindowsFeature -Name $name -ErrorAction SilentlyContinue
+            if ($feat -and $feat.Installed) {
+                Uninstall-WindowsFeature -Name $name -ErrorAction Stop | Out-Null
+                $changed = $true
+            }
+        }
+    }
+    if (-not $changed) {
+        Write-Log "OS feature already off or not present on this SKU: $((@($OptionalFeatureNames) + @($ServerFeatureNames)) -join ', ')"
+    }
+}
+
+function Set-SecpolIniValue {
+    param([string[]]$Lines, [string]$Name, [string]$Value)
+    $pattern = '^\s*{0}\s*=' -f [regex]::Escape($Name)
+    $set = $false
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $Lines) {
+        if ($line -match $pattern) {
+            $out.Add("$Name = $Value") | Out-Null
+            $set = $true
+        } else {
+            $out.Add($line) | Out-Null
+        }
+    }
+    if ($set) { return @($out) }
+
+    $inserted = $false
+    $final = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $out) {
+        $final.Add($line) | Out-Null
+        if (-not $inserted -and $line -match '^\[System Access\]') {
+            $final.Add("$Name = $Value") | Out-Null
+            $inserted = $true
+        }
+    }
+    if (-not $inserted) {
+        $final.Add('[System Access]') | Out-Null
+        $final.Add("$Name = $Value") | Out-Null
+    }
+    return @($final)
 }
 
 function Set-Reg {
@@ -304,14 +434,21 @@ function Invoke-Backup {
     $b = Join-Path $Config.BackupDir "backup_$Stamp"
     $null = New-Item -ItemType Directory -Force -Path $b
     netsh advfirewall export "$b\firewall.wfw" | Out-Null
+    if ((Get-NativeExitCode) -ne 0) { Write-Log 'Firewall export failed' 'WARN' }
     secedit /export /cfg "$b\secpol.cfg"
+    if ((Get-NativeExitCode) -ne 0) { Write-Log 'secedit export failed' 'WARN' }
     auditpol /backup /file:"$b\audit.csv" | Out-Null
+    if ((Get-NativeExitCode) -ne 0) { Write-Log 'auditpol backup failed' 'WARN' }
     Get-Service | Select-Object Name, DisplayName, Status, StartType | Export-Csv "$b\services.csv" -NoTypeInformation
     try { Get-SmbShare | Export-Csv "$b\shares.csv" -NoTypeInformation } catch { Write-Log "Share backup skipped: $($_.Exception.Message)" 'WARN' }
     Get-ScheduledTask | Select-Object TaskName, TaskPath, State | Export-Csv "$b\tasks.csv" -NoTypeInformation
     if (-not $IsDC) {
         Get-LocalUser | Export-Csv "$b\localusers.csv" -NoTypeInformation
-        Get-LocalGroupMember -Group 'Administrators' | Export-Csv "$b\localadmins.csv" -NoTypeInformation
+        try {
+            Get-LocalGroupMember -Group 'Administrators' | Export-Csv "$b\localadmins.csv" -NoTypeInformation
+        } catch {
+            Write-Log "Local Administrators backup skipped: $($_.Exception.Message)" 'WARN'
+        }
     }
     $keys = @{
         lsa      = 'HKLM\SYSTEM\CurrentControlSet\Control\Lsa'
@@ -429,8 +566,8 @@ function Set-AccountPassword {
         return
     }
     Invoke-Step "Reset password for $Name ($($Config.PasswordMode))" {
-        if ($IsDC) { Set-ADAccountPassword -Identity $Name -Reset -NewPassword $sec }
-        else       { Set-LocalUser -Name $Name -Password $sec }
+        if ($IsDC) { Set-ADAccountPassword -Identity $Name -Reset -NewPassword $sec -ErrorAction Stop }
+        else       { Set-LocalUser -Name $Name -Password $sec -ErrorAction Stop }
     }
 }
 
@@ -448,26 +585,31 @@ function Invoke-Users {
 
     if ($IsDC) {
         Import-Module ActiveDirectory
-        $accounts = Get-ADUser -Filter * -Properties Enabled, SamAccountName
+        $accounts = Get-ADUser -Filter * -Properties Enabled, SamAccountName, SID
     } else {
         $accounts = Get-LocalUser
     }
 
     foreach ($u in $accounts) {
         $n = if ($IsDC) { $u.SamAccountName } else { $u.Name }
-        if (Test-NameInList -Name $n -List $protected) { Write-Log "Skipping protected account $n"; continue }
+        if (Test-IsProtectedAccount -Name $n -Account $u -ProtectedNames $protected) {
+            Write-Log "Skipping protected account $n"
+            continue
+        }
 
         if ($n -eq 'Guest' -or -not (Test-NameInList -Name $n -List $auth)) {
             if ($u.Enabled) {
                 Invoke-Step "Disable unauthorized account $n" {
-                    if ($IsDC) { Disable-ADAccount -Identity $n } else { Disable-LocalUser -Name $n }
+                    Set-AccountEnabledState -Name $n -Enabled $false
                 }
+            } else {
+                Write-Log "Unauthorized account $n already disabled"
             }
             continue
         }
         if (-not $u.Enabled) {
             Invoke-Step "Enable authorized account $n" {
-                if ($IsDC) { Enable-ADAccount -Identity $n } else { Enable-LocalUser -Name $n }
+                Set-AccountEnabledState -Name $n -Enabled $true
             }
         }
         Set-AccountPassword -Name $n
@@ -488,7 +630,7 @@ function Invoke-Users {
                   'Server Operators','Backup Operators','DnsAdmins','Group Policy Creator Owners'
         foreach ($g in $groups) {
             Get-ADGroupMember -Identity $g -ErrorAction SilentlyContinue | Where-Object { $_.objectClass -eq 'user' } | ForEach-Object {
-                if (-not (Test-NameInList -Name $_.SamAccountName -List $keep)) {
+                if (-not (Test-IsProtectedAccount -Name $_.SamAccountName -Account $_ -ProtectedNames $keep)) {
                     $m = $_.SamAccountName
                     Invoke-Step "Remove $m from AD group $g" { Remove-ADGroupMember -Identity $g -Members $m -Confirm:$false }
                 }
@@ -498,7 +640,7 @@ function Invoke-Users {
         foreach ($m in (Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue)) {
             $short = ($m.Name -split '\\')[-1]
             if ($m.ObjectClass -eq 'Group') { Write-Log "Group in local Administrators left alone: $($m.Name) - review it" 'WARN'; continue }
-            if (-not (Test-NameInList -Name $short -List $keep)) {
+            if (-not (Test-IsProtectedAccount -Name $short -Account $m -ProtectedNames $keep)) {
                 Invoke-Step "Remove $($m.Name) from local Administrators" { Remove-LocalGroupMember -Group 'Administrators' -Member $m.Name }
             }
         }
@@ -510,6 +652,21 @@ function Invoke-Users {
                 }
             }
         }
+    }
+
+    Write-Log 'Account Enabled status after Users module (this is the live check, not the earlier recon dump):'
+    try {
+        if ($IsDC) {
+            Get-ADUser -Filter * -Properties Enabled, SamAccountName | Sort-Object SamAccountName | ForEach-Object {
+                Write-Log ("  {0}  Enabled={1}" -f $_.SamAccountName, $_.Enabled)
+            }
+        } else {
+            Get-LocalUser | Sort-Object Name | ForEach-Object {
+                Write-Log ("  {0}  Enabled={1}" -f $_.Name, $_.Enabled)
+            }
+        }
+    } catch {
+        Write-Log "Could not enumerate accounts for verification: $($_.Exception.Message)" 'ERROR'
     }
 }
 
@@ -527,18 +684,28 @@ function Invoke-PasswordPolicy {
     } else {
         Invoke-Step 'Local password / lockout policy' {
             net accounts /minpwlen:$($Config.PasswordMinLength) /uniquepw:10 /lockoutthreshold:$($Config.LockoutThreshold) /lockoutduration:30 /lockoutwindow:30 | Out-Null
+            $netCode = Get-NativeExitCode
+            if ($netCode -ne 0) { throw "net accounts failed with exit code $netCode" }
             $cfg = Join-Path $Config.BackupDir 'secpol_apply.cfg'
             secedit /export /cfg $cfg
-            (Get-Content $cfg) -replace 'PasswordComplexity\s*=\s*\d', 'PasswordComplexity = 1' `
-                               -replace 'ClearTextPassword\s*=\s*\d',  'ClearTextPassword = 0' | Set-Content $cfg
+            $exportCode = Get-NativeExitCode
+            if ($exportCode -ne 0) { throw "secedit /export failed with exit code $exportCode" }
+            $secpol = Get-Content -LiteralPath $cfg
+            $secpol = Set-SecpolIniValue -Lines $secpol -Name 'PasswordComplexity' -Value '1'
+            $secpol = Set-SecpolIniValue -Lines $secpol -Name 'ClearTextPassword' -Value '0'
+            Set-Content -LiteralPath $cfg -Value $secpol
             secedit /configure /db "$env:windir\security\local.sdb" /cfg $cfg /areas SECURITYPOLICY /quiet
+            $cfgCode = Get-NativeExitCode
+            if ($cfgCode -ne 0) { throw "secedit /configure failed with exit code $cfgCode" }
         }
     }
 }
 
 # Firewall
 function Invoke-Firewall {
-    if ($Config.ResetFirewallFirst) { Invoke-Step 'Reset firewall to defaults' { netsh advfirewall reset | Out-Null } }
+    if ($Config.ResetFirewallFirst) {
+        Invoke-Step 'Reset firewall to defaults' -SuccessExitCodes 0 { netsh advfirewall reset | Out-Null }
+    }
 
     Invoke-Step 'Enable firewall, default-deny inbound, logging' {
         Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled True -DefaultInboundAction Block `
@@ -609,6 +776,8 @@ function Invoke-Services {
         Invoke-Step "Scored service $s -> Automatic, running, auto-restart" {
             Set-Service -Name $s -StartupType Automatic
             sc.exe failure $s reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+            $scCode = Get-NativeExitCode
+            if ($scCode -ne 0) { throw "sc.exe failure failed with exit code $scCode" }
             if ((Get-Service -Name $s).Status -ne 'Running') { Start-Service -Name $s }
         }
     }
@@ -673,13 +842,8 @@ function Invoke-Registry {
         }
     }
     Invoke-Step 'Disable PowerShell v2 (downgrade attacks)' {
-        $features = @('MicrosoftWindowsPowerShellV2Root', 'MicrosoftWindowsPowerShellV2')
-        foreach ($f in $features) {
-            $feat = Get-WindowsOptionalFeature -Online -FeatureName $f -ErrorAction SilentlyContinue
-            if ($feat -and $feat.State -eq 'Enabled') {
-                Disable-WindowsOptionalFeature -Online -FeatureName $f -NoRestart -ErrorAction Stop | Out-Null
-            }
-        }
+        Disable-OsFeature -OptionalFeatureNames @('MicrosoftWindowsPowerShellV2Root', 'MicrosoftWindowsPowerShellV2') `
+            -ServerFeatureNames @('PowerShell-V2')
     }
 }
 
@@ -688,10 +852,7 @@ function Invoke-SMB {
     Invoke-Step 'Disable SMBv1 server' { Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force }
     Invoke-Step 'Ensure SMBv2/3 enabled' { Set-SmbServerConfiguration -EnableSMB2Protocol $true -Force }
     Invoke-Step 'Remove SMB1 Windows feature' {
-        $feat = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue
-        if ($feat -and $feat.State -eq 'Enabled') {
-            Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart | Out-Null
-        }
+        Disable-OsFeature -OptionalFeatureNames @('SMB1Protocol') -ServerFeatureNames @('FS-SMB1')
     }
     Invoke-Step 'Clear SMB null-session pipes/shares' {
         Set-SmbServerConfiguration -NullSessionPipes @() -NullSessionShares @() -Force
@@ -704,11 +865,15 @@ function Invoke-SMB {
 # Auditing / logging
 function Invoke-Audit {
     # Quote /category:* so PowerShell does not expand * to filenames in the current directory
-    Invoke-Step 'Enable success+failure auditing, all categories' { auditpol.exe /set '/category:*' /success:enable /failure:enable | Out-Null }
-    foreach ($log in 'Security', 'System', 'Application') {
-        Invoke-Step "Grow $log event log to 512MB" { wevtutil sl $log /ms:536870912 }
+    Invoke-Step 'Enable success+failure auditing, all categories' -SuccessExitCodes 0 {
+        auditpol.exe /set '/category:*' /success:enable /failure:enable | Out-Null
     }
-    Invoke-Step 'Enable PowerShell operational log' { wevtutil sl 'Microsoft-Windows-PowerShell/Operational' /e:true }
+    foreach ($log in 'Security', 'System', 'Application') {
+        Invoke-Step "Grow $log event log to 512MB" -SuccessExitCodes 0 { wevtutil sl $log /ms:536870912 }
+    }
+    Invoke-Step 'Enable PowerShell operational log' -SuccessExitCodes 0 {
+        wevtutil sl 'Microsoft-Windows-PowerShell/Operational' /e:true
+    }
 }
 
 # Shares
