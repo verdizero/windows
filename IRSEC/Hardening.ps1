@@ -1,23 +1,27 @@
 <#
 .SYNOPSIS
-  Windows Blue Team Hardening and Incident Response Installation Toolkit
+  oh em gosh bro :/ i wrote most of this myself but i had to learn powershell in two weeks so
+  ofc i needed some help i'm crine i'm so stressed
 
 .USAGE
   1. Fill in the config block below, OR leave it generic and make one small
      per-host file (see EXAMPLE CONFIG FILE at the bottom) and pass -ConfigFile
-  2. Pass -InstallTools to install Sysinternals, SCT, BloodHound, and SharpHound:
-     .\Harden-Windows.ps1 -InstallTools
-  3. Pass -DryRun to only audit, not make changes:   .\Hardening.ps1 -DryRun -ConfigFile .\web01.ps1
-  4. Review suggestions and then apply:    .\Hardening.ps1 -ConfigFile .\web01.ps1
+  2. Install Sysinternals, Sysmon, Everything:
+     .\Hardening.ps1 -InstallTools
+  3. Audit only (no hardening changes). Backup + Recon still run:
+     .\Hardening.ps1 -DryRun -ConfigFile .\web01.ps1
+  4. Review suggestions and then apply:
+     .\Hardening.ps1 -ConfigFile .\web01.ps1
   Run only some:            .\Hardening.ps1 -Only Users,Firewall
   Skip some:                .\Hardening.ps1 -Skip Services,Registry
 
-  Ordered Modules:
+  Modules (run in this order):
     Tools, Backup, Recon, Users, PasswordPolicy, Firewall, Services, Registry, SMB,
     Audit, Shares, RoleSpecific, Custom
 
-  Everything --> $Config.BackupDir. Backup + Recon establish what's
-  already on this box before any changes, runs even with -DryRun
+  Backup + Recon always run (even with -DryRun / -Only) unless you -Skip them.
+  -InstallTools with no -Only runs ONLY the Tools module.
+  Applying changes (no -DryRun) requires an elevated PowerShell session.
 
   !! Everything that commonly breaks scoring has a flag in config and is off by default
   !! Check your scoring requirements first if you have them (ik IRSEC doesn't probably)
@@ -34,43 +38,55 @@ param(
     [string]$ConfigFile
 )
 
-if (-not $DryRun -and -not $InstallTools) {
-    Write-Warning 'No execution switch specified. Use -DryRun to audit or -InstallTools to run the toolkit.'
-    return
-}
-
 $ErrorActionPreference = 'Continue'
 
+function Test-IsAdministrator {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($id)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Resolve-ConfigFilePath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    if (Test-Path -LiteralPath $Path) { return (Resolve-Path -LiteralPath $Path).Path }
+    if ($PSScriptRoot) {
+        $besideScript = Join-Path $PSScriptRoot $Path
+        if (Test-Path -LiteralPath $besideScript) { return (Resolve-Path -LiteralPath $besideScript).Path }
+    }
+    throw "Config file not found: $Path"
+}
+
 $Config = [ordered]@{
-    HostLabel            = ''             
-    Role                 = 'Workstation'  # DC | Web (IIS) | DNS | FTP | File | Mail | Workstation
+    HostLabel            = ''             # ex. 'web01', computername
+    Role                 = ''  # DC | Web (IIS) | DNS | FTP | File | Mail | Workstation
 
-    # case-insensitive, SamAccountName or local username only
-    AuthorizedAdmins     = @('principal', 'sportingdir', 'chiefeng', 'strategist', 'scrutineer', 'techdirector', 'crewchief', 'firecrew')
-    AuthorizedUsers      = @('pitcrew', 'mechanic', 'analyst', 'driver', 'tireman', 'jackcrew', 'garagecrew', 'celebrity', 'pitlaner', 'reserve', 'gunners')
-    ProtectedAccounts    = @('whiteteam')
-    RDPUsers             = @()            # allowed in "remote desktop users"
-    PasswordMode         = 'Prompt'       # random = unique pw per account -> CSV, prompt = one pw for all, or none
+    # Accounts --> case-insensitive, SamAccountName or local username only
+    AuthorizedAdmins     = @('principal', 'sportingdir', 'chiefeng', 'strategist', 'scrutineer', 'techdirector', 'crewchief', 'firecrew','whiteteam')
+    AuthorizedUsers      = @('pitcrew', 'mechanic', 'analyst', 'driver', 'tireman', 'jackcrew', 'garagecrew', 'celebrity', 'pitlaner', 'reserve', 'gunners', 'whiteteam')
+    ProtectedAccounts    = @('whiteteam', 'Administrator')
+    RDPUsers             = @()            
+    PasswordMode         = 'Prompt'       # random = unique pw per account into csv, prompt = one pw for all, None
 
-    # Services / network 
-    ScoredServices       = @()            # service short names like 'W3SVC','DNS','MSSQLSERVER.' look up short name and tailor to computer
+    # Services / network
+    ScoredServices       = @()            # service short names like 'W3SVC','DNS','MSSQLSERVER'. look up short name and tailor to computer
     AllowedInboundTCP    = @()            # ex. 80,443  (ranges ok: '49152-65535')
     AllowedInboundUDP    = @()            # ex. 53
-    UseRoleDefaultPorts  = $true        # also open typical ports for $Role
+    UseRoleDefaultPorts  = $true        
     AllowPing            = $false         # scoring often uses ICMP, but only on one workstation
     ScoringEngineIPs     = @()            # if set, scored ports are limited to these + TrustedIPs
-    TrustedIPs           = @('192.168.15.1', '192.168.15.2', '10.15.1.1', '10.15.1.2', '10.15.1.3', '10.15.1.254', '172.20.1.15')
+    TrustedIPs           = @('10.15.1.254', '172.20.1.15', '10.15.1.1', '10.15.1.2', '10.15.1.3', '192.168.15.1', '192.168.15.2')
     EnableRDP            = $false         
     EnableWinRM          = $false         
-    ResetFirewallFirst   = $false
+    ResetFirewallFirst   = $false         # wipe firewall to defaults before applying rules
 
     # Things that can break scoring
-    DisableSpooler       = $true          # set false on print servers
+    DisableSpooler       = $true          # print spooler (PrintNightmare). Set $false on print servers
     RequireSMBSigning    = $true          # true breaks some old/Samba clients
-    LmCompatibilityLevel = 4              # 5 = NTLMv2 only 
+    LmCompatibilityLevel = 4              # 5 = NTLMv2 only (strongest, may break legacy clients)
     DisableNetBIOS       = $false
-    RequireLdapSigning   = $true         # DC only, true breaks simple/unsigned LDAP binds
-    RemoveUnlistedShares = $true         # true deletes non-default shares not in AllowedShares
+    RequireLdapSigning   = $false         # DC only, true breaks simple/unsigned LDAP binds
+    RemoveUnlistedShares = $false         # $true deletes non-default shares not in AllowedShares
     AllowedShares        = @()            # share names to keep
 
     ServicesToDisable    = @('TlntSvr','RemoteRegistry','SNMP','SSDPSRV','upnphost','WebClient',
@@ -99,20 +115,38 @@ $Config.TrustedIPs        = @('10.0.0.50')
 $Config.EnableRDP         = $true
 #>
 
-if ($ConfigFile) { . $ConfigFile }   # per-host overrides, edits $Config directly
+if ($ConfigFile) {
+    $resolvedConfig = Resolve-ConfigFilePath -Path $ConfigFile
+    . $resolvedConfig
+}
 
-$null = New-Item -ItemType Directory -Force -Path $Config.BackupDir
+$IsAdmin = Test-IsAdministrator
+if (-not $DryRun -and -not $IsAdmin) {
+    throw 'Reopen Powershell as Administrator!'
+}
+
+try {
+    $null = New-Item -ItemType Directory -Force -Path $Config.BackupDir -ErrorAction Stop
+} catch {
+    $fallback = Join-Path $env:TEMP 'harden-backups'
+    Write-Warning "Could not create $($Config.BackupDir) ($($_.Exception.Message)). Using $fallback"
+    $Config.BackupDir = $fallback
+    $null = New-Item -ItemType Directory -Force -Path $Config.BackupDir
+}
+
 $Stamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
 $LogFile = Join-Path $Config.BackupDir "harden_$Stamp.log"
 $IsDC    = ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4)
-$PwRows  = @()
+$PwRows  = New-Object System.Collections.Generic.List[object]
 $SharedSecure = $null
+$script:ChocolateyExe = $null
 
 function Write-Log {
     param([string]$Msg, [string]$Level = 'INFO')
     $colors = @{ INFO='Gray'; OK='Green'; WARN='Yellow'; ERROR='Red'; DRY='Cyan' }
     $line = '{0} [{1}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Msg
-    Write-Host $line -ForegroundColor $colors[$Level]
+    $color = $colors[$Level]
+    if ($color) { Write-Host $line -ForegroundColor $color } else { Write-Host $line }
     Add-Content -Path $LogFile -Value $line
 }
 
@@ -123,46 +157,78 @@ function Invoke-Step {
     catch { Write-Log "$Desc :: $($_.Exception.Message)" 'ERROR' }
 }
 
+function Test-NameInList {
+    param([string]$Name, [string[]]$List)
+    if ([string]::IsNullOrWhiteSpace($Name) -or -not $List) { return $false }
+    foreach ($item in $List) {
+        if ($item -and ($Name -ieq $item)) { return $true }
+    }
+    return $false
+}
+
+function ConvertTo-UniquePortList {
+    param($Ports)
+    @($Ports) |
+        Where-Object { $null -ne $_ -and "$_".Trim() -ne '' } |
+        ForEach-Object { "$_".Trim() } |
+        Select-Object -Unique
+}
+
 function Set-Reg {
     param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord')
     Invoke-Step "REG $Path -> $Name = $Value" {
-        if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+        if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
         Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force
     }
 }
 
 function New-RandomPassword {
     param([int]$Length = 20)
+    if ($Length -lt 8) { $Length = 8 }
     $sets = @('ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnpqrstuvwxyz', '23456789', '!@#%^*-_=+')
+    $all  = $sets -join ''
     $rng  = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    function Get-Rand($max) { $b = New-Object byte[] 4; $rng.GetBytes($b); [int]([BitConverter]::ToUInt32($b, 0) % $max) }
-    $all = $sets -join ''
-    $chars = @()
-    foreach ($s in $sets) { $chars += $s[(Get-Rand $s.Length)] }
-    while ($chars.Count -lt $Length) { $chars += $all[(Get-Rand $all.Length)] }
-    for ($i = $chars.Count - 1; $i -gt 0; $i--) {
-        $j = Get-Rand ($i + 1); $t = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $t
+    $buf  = New-Object byte[] 4
+    $pick = {
+        param([int]$Max)
+        $rng.GetBytes($buf)
+        [int]([BitConverter]::ToUInt32($buf, 0) % [uint32]$Max)
     }
-    -join $chars
+    try {
+        $chars = New-Object System.Collections.Generic.List[char]
+        foreach ($s in $sets) { $chars.Add($s[(& $pick $s.Length)]) }
+        while ($chars.Count -lt $Length) { $chars.Add($all[(& $pick $all.Length)]) }
+        for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+            $j = & $pick ($i + 1)
+            $t = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $t
+        }
+        -join $chars
+    } finally {
+        $rng.Dispose()
+    }
+}
+
+function Get-NativeExitCode {
+    if ($null -ne $LASTEXITCODE) { return [int]$LASTEXITCODE }
+    if ($?) { return 0 }
+    return 1
 }
 
 if ($PSSenderInfo -and -not $Config.EnableWinRM) {
-    Write-Log "Forcing EnableWinRM = $true so you don't lock yourself out silly" 'WARN'
+    Write-Log "Forcing EnableWinRM = true so you don't lock yourself out silly" 'WARN'
     $Config.EnableWinRM = $true
 }
 if ($env:SESSIONNAME -like 'RDP-*' -and -not $Config.EnableRDP) {
-    Write-Log "Forcing EnableRDP = $true so you don't lock yourself out silly" 'WARN'
+    Write-Log "Forcing EnableRDP = true so you don't lock yourself out silly" 'WARN'
     $Config.EnableRDP = $true
 }
 
 # Tools installation module
 function Invoke-Tools {
-    if (-not $InstallTools -and -not ($Only -contains 'Tools')) { return }
+    if (-not $InstallTools -and -not (Test-NameInList -Name 'Tools' -List $Only)) { return }
 
-    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-        [Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isAdmin) {
-        throw 'Tool installation requires an elevated PowerShell session - reopen PowerShell as Administrator and rerun -InstallTools'
+    if (-not $DryRun -and -not $IsAdmin) {
+        throw 'Reopen Powershell as an Administrator to install tools!'
     }
 
     if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
@@ -173,33 +239,39 @@ function Invoke-Tools {
             Set-ExecutionPolicy Bypass -Scope Process -Force
             $installScript = Join-Path $env:TEMP 'install-chocolatey.ps1'
             Invoke-WebRequest -Uri 'https://community.chocolatey.org/install.ps1' -OutFile $installScript -UseBasicParsing -ErrorAction Stop
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installScript
-            if ($LASTEXITCODE -ne 0) { throw "Chocolatey bootstrap failed with exit code $LASTEXITCODE" }
+            $proc = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installScript
+            ) -Wait -PassThru -WindowStyle Hidden
             Remove-Item -LiteralPath $installScript -Force -ErrorAction SilentlyContinue
+            if ($proc.ExitCode -ne 0) { throw "Chocolatey bootstrap failed with exit code $($proc.ExitCode)" }
             $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
                         [Environment]::GetEnvironmentVariable('Path', 'User')
-            if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
-                $chocoExe = Join-Path $env:ProgramData 'chocolatey\bin\choco.exe'
-                if (Test-Path -LiteralPath $chocoExe) { $script:ChocolateyExe = $chocoExe }
-                else { throw 'Chocolatey installation completed but choco.exe was not found!' }
+            $chocoExe = Join-Path $env:ProgramData 'chocolatey\bin\choco.exe'
+            if (Get-Command choco.exe -ErrorAction SilentlyContinue) {
+                $script:ChocolateyExe = (Get-Command choco.exe).Source
+            } elseif (Test-Path -LiteralPath $chocoExe) {
+                $script:ChocolateyExe = $chocoExe
+            } else {
+                throw 'Chocolatey installation completed but choco.exe was not found!'
             }
         }
     }
 
     $chocoExe = if ($script:ChocolateyExe) { $script:ChocolateyExe } else {
-        (Get-Command choco.exe -ErrorAction Stop).Source
+        $cmd = Get-Command choco.exe -ErrorAction SilentlyContinue
+        if ($cmd) { $cmd.Source } else { Join-Path $env:ProgramData 'chocolatey\bin\choco.exe' }
     }
 
     $packages = @(
-        @{ Id = 'sysinternals'; Label = 'Microsoft Sysinternals Suite' },
-        @{ Id = 'sysmon';       Label = 'Sysmon' },
-        @{ Id = 'everything';   Label = 'Voidtools Everything' }
+        @{ Id = 'sysinternals';  Label = 'Microsoft Sysinternals Suite' },
+        @{ Id = 'sysmon';        Label = 'Sysmon' },
+        @{ Id = 'everything';    Label = 'Voidtools Everything' }
     )
 
     foreach ($pkg in $packages) {
         Invoke-Step "Install/update $($pkg.Label) via Chocolatey ($($pkg.Id))" {
             & $chocoExe upgrade $pkg.Id -y --no-progress
-            $exitCode = $LASTEXITCODE
+            $exitCode = Get-NativeExitCode
             if ($exitCode -notin @(0, 3010)) {
                 throw "Chocolatey package '$($pkg.Id)' failed with exit code $exitCode."
             }
@@ -218,7 +290,8 @@ function Invoke-Tools {
             $sctUrl,
             '',
             'Select and download the baseline matching this operating system, then extract it into this folder.',
-            'No verified chocolatey package is configured for this toolkit.'
+            'No verified chocolatey package is configured for this toolkit.',
+            'Sysmon is installed as a service only after you install a configuration XML (sysmon.exe -accepteula -i config.xml).'
         ) -ErrorAction Stop
         Write-Log "SCT instructions written to $sctPath"
     }
@@ -231,10 +304,10 @@ function Invoke-Backup {
     $b = Join-Path $Config.BackupDir "backup_$Stamp"
     $null = New-Item -ItemType Directory -Force -Path $b
     netsh advfirewall export "$b\firewall.wfw" | Out-Null
-    secedit /export /cfg "$b\secpol.cfg" /quiet
+    secedit /export /cfg "$b\secpol.cfg"
     auditpol /backup /file:"$b\audit.csv" | Out-Null
     Get-Service | Select-Object Name, DisplayName, Status, StartType | Export-Csv "$b\services.csv" -NoTypeInformation
-    Get-SmbShare | Export-Csv "$b\shares.csv" -NoTypeInformation
+    try { Get-SmbShare | Export-Csv "$b\shares.csv" -NoTypeInformation } catch { Write-Log "Share backup skipped: $($_.Exception.Message)" 'WARN' }
     Get-ScheduledTask | Select-Object TaskName, TaskPath, State | Export-Csv "$b\tasks.csv" -NoTypeInformation
     if (-not $IsDC) {
         Get-LocalUser | Export-Csv "$b\localusers.csv" -NoTypeInformation
@@ -247,7 +320,7 @@ function Invoke-Backup {
         ts       = 'HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server'
         policies = 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies'
     }
-    foreach ($k in $keys.Keys) { reg export $keys[$k] "$b\$k.reg" /y | Out-Null }
+    foreach ($k in $keys.Keys) { reg.exe export $keys[$k] "$b\$k.reg" /y | Out-Null }
     Write-Log "Backup saved to $b" 'OK'
     Write-Log "Firewall rollback: netsh advfirewall import `"$b\firewall.wfw`"" 'INFO'
 }
@@ -309,12 +382,16 @@ function Invoke-Recon {
                              if ($d) { [pscustomobject]@{ Key = $_.PSChildName; Debugger = $d } } }
     }
     Add-Section 'Accessibility binaries replaced? (sticky keys backdoor)' {
-        $h = @{ cmd = (Get-FileHash "$env:windir\System32\cmd.exe").Hash
-                ps  = (Get-FileHash "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe").Hash }
+        $h = @{
+            cmd = (Get-FileHash "$env:windir\System32\cmd.exe" -ErrorAction Stop).Hash
+            ps  = (Get-FileHash "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" -ErrorAction Stop).Hash
+        }
         'sethc','utilman','osk','narrator','magnify','displayswitch' | ForEach-Object {
-            $f = "$env:windir\System32\$_.exe"
-            if (Test-Path $f) { $x = (Get-FileHash $f).Hash
-                [pscustomobject]@{ File = $f; SameAsCmd = ($x -eq $h.cmd); SameAsPowerShell = ($x -eq $h.ps) } }
+            $f = Join-Path $env:windir "System32\$_.exe"
+            if (Test-Path -LiteralPath $f) {
+                $x = (Get-FileHash -LiteralPath $f).Hash
+                [pscustomobject]@{ File = $f; SameAsCmd = ($x -eq $h.cmd); SameAsPowerShell = ($x -eq $h.ps) }
+            }
         }
     }
     Add-Section 'WMI event subscriptions (persistence)' {
@@ -340,8 +417,16 @@ function Set-AccountPassword {
         'Random' {
             $plain = New-RandomPassword
             $sec = ConvertTo-SecureString $plain -AsPlainText -Force
-            if (-not $DryRun) { $script:PwRows += [pscustomobject]@{ Host = $env:COMPUTERNAME; User = $Name; Password = $plain } }
+            if (-not $DryRun) { $PwRows.Add([pscustomobject]@{ Host = $env:COMPUTERNAME; User = $Name; Password = $plain }) }
         }
+        default {
+            Write-Log "Unknown PasswordMode '$($Config.PasswordMode)' - skipping password reset for $Name" 'WARN'
+            return
+        }
+    }
+    if (-not $sec) {
+        Write-Log "No password material for $Name (Prompt value missing?) - skip reset" 'WARN'
+        return
     }
     Invoke-Step "Reset password for $Name ($($Config.PasswordMode))" {
         if ($IsDC) { Set-ADAccountPassword -Identity $Name -Reset -NewPassword $sec }
@@ -363,16 +448,16 @@ function Invoke-Users {
 
     if ($IsDC) {
         Import-Module ActiveDirectory
-        $accounts = Get-ADUser -Filter * -Properties Enabled
+        $accounts = Get-ADUser -Filter * -Properties Enabled, SamAccountName
     } else {
         $accounts = Get-LocalUser
     }
 
     foreach ($u in $accounts) {
         $n = if ($IsDC) { $u.SamAccountName } else { $u.Name }
-        if ($protected -contains $n) { Write-Log "Skipping protected account $n"; continue }
+        if (Test-NameInList -Name $n -List $protected) { Write-Log "Skipping protected account $n"; continue }
 
-        if ($n -eq 'Guest' -or $auth -notcontains $n) {
+        if ($n -eq 'Guest' -or -not (Test-NameInList -Name $n -List $auth)) {
             if ($u.Enabled) {
                 Invoke-Step "Disable unauthorized account $n" {
                     if ($IsDC) { Disable-ADAccount -Identity $n } else { Disable-LocalUser -Name $n }
@@ -388,7 +473,11 @@ function Invoke-Users {
         Set-AccountPassword -Name $n
     }
     foreach ($a in $auth) {
-        $exists = if ($IsDC) { Get-ADUser -Filter "SamAccountName -eq '$a'" } else { Get-LocalUser -Name $a -ErrorAction SilentlyContinue }
+        $exists = if ($IsDC) {
+            Get-ADUser -Identity $a -ErrorAction SilentlyContinue
+        } else {
+            Get-LocalUser -Name $a -ErrorAction SilentlyContinue
+        }
         if (-not $exists) { Write-Log "Authorized account '$a' does not exist on this host" 'WARN' }
     }
 
@@ -399,7 +488,7 @@ function Invoke-Users {
                   'Server Operators','Backup Operators','DnsAdmins','Group Policy Creator Owners'
         foreach ($g in $groups) {
             Get-ADGroupMember -Identity $g -ErrorAction SilentlyContinue | Where-Object { $_.objectClass -eq 'user' } | ForEach-Object {
-                if ($keep -notcontains $_.SamAccountName) {
+                if (-not (Test-NameInList -Name $_.SamAccountName -List $keep)) {
                     $m = $_.SamAccountName
                     Invoke-Step "Remove $m from AD group $g" { Remove-ADGroupMember -Identity $g -Members $m -Confirm:$false }
                 }
@@ -409,14 +498,14 @@ function Invoke-Users {
         foreach ($m in (Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue)) {
             $short = ($m.Name -split '\\')[-1]
             if ($m.ObjectClass -eq 'Group') { Write-Log "Group in local Administrators left alone: $($m.Name) - review it" 'WARN'; continue }
-            if ($keep -notcontains $short) {
+            if (-not (Test-NameInList -Name $short -List $keep)) {
                 Invoke-Step "Remove $($m.Name) from local Administrators" { Remove-LocalGroupMember -Group 'Administrators' -Member $m.Name }
             }
         }
         if ($Config.RDPUsers.Count -gt 0) {
             foreach ($m in (Get-LocalGroupMember -Group 'Remote Desktop Users' -ErrorAction SilentlyContinue)) {
                 $short = ($m.Name -split '\\')[-1]
-                if ($Config.RDPUsers -notcontains $short -and $protected -notcontains $short) {
+                if (-not (Test-NameInList -Name $short -List $Config.RDPUsers) -and -not (Test-NameInList -Name $short -List $protected)) {
                     Invoke-Step "Remove $($m.Name) from Remote Desktop Users" { Remove-LocalGroupMember -Group 'Remote Desktop Users' -Member $m.Name }
                 }
             }
@@ -431,14 +520,15 @@ function Invoke-PasswordPolicy {
             Import-Module ActiveDirectory
             Set-ADDefaultDomainPasswordPolicy -Identity (Get-ADDomain).DistinguishedName `
                 -MinPasswordLength $Config.PasswordMinLength -ComplexityEnabled $true -PasswordHistoryCount 10 `
-                -LockoutThreshold $Config.LockoutThreshold -LockoutDuration '00:30:00' -LockoutObservationWindow '00:30:00' `
+                -LockoutThreshold $Config.LockoutThreshold -LockoutDuration ([TimeSpan]::FromMinutes(30)) `
+                -LockoutObservationWindow ([TimeSpan]::FromMinutes(30)) `
                 -ReversibleEncryptionEnabled $false
         }
     } else {
         Invoke-Step 'Local password / lockout policy' {
             net accounts /minpwlen:$($Config.PasswordMinLength) /uniquepw:10 /lockoutthreshold:$($Config.LockoutThreshold) /lockoutduration:30 /lockoutwindow:30 | Out-Null
             $cfg = Join-Path $Config.BackupDir 'secpol_apply.cfg'
-            secedit /export /cfg $cfg /quiet
+            secedit /export /cfg $cfg
             (Get-Content $cfg) -replace 'PasswordComplexity\s*=\s*\d', 'PasswordComplexity = 1' `
                                -replace 'ClearTextPassword\s*=\s*\d',  'ClearTextPassword = 0' | Set-Content $cfg
             secedit /configure /db "$env:windir\security\local.sdb" /cfg $cfg /areas SECURITYPOLICY /quiet
@@ -456,10 +546,10 @@ function Invoke-Firewall {
             -LogFileName '%systemroot%\system32\LogFiles\Firewall\pfirewall.log' -LogMaxSizeKilobytes 16384
     }
     Invoke-Step 'Remove previous BT-* rules (idempotent)' {
-        Get-NetFirewallRule -Name 'BT-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+        Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'BT-*' } | Remove-NetFirewallRule
     }
 
-    # typical ports per role. trim  if scored services don't need them
+    # typical ports per role. trim if scored services don't need them
     $roleTCP = @{ DC = @(53,88,135,389,445,464,636,3268,3269,'49152-65535'); Web = @(80,443); DNS = @(53)
                   FTP = @(21,'49152-65535'); File = @(445); Mail = @(25,110,143,587,993,995); Workstation = @() }
     $roleUDP = @{ DC = @(53,88,123,389,464); DNS = @(53) }
@@ -469,8 +559,8 @@ function Invoke-Firewall {
         if ($roleTCP.ContainsKey($Config.Role)) { $tcp += $roleTCP[$Config.Role] }
         if ($roleUDP.ContainsKey($Config.Role)) { $udp += $roleUDP[$Config.Role] }
     }
-    $tcp = $tcp | Where-Object { $_ } | Select-Object -Unique
-    $udp = $udp | Where-Object { $_ } | Select-Object -Unique
+    $tcp = ConvertTo-UniquePortList $tcp
+    $udp = ConvertTo-UniquePortList $udp
 
     $scoredRemote = @($Config.ScoringEngineIPs + $Config.TrustedIPs) | Where-Object { $_ }
     if (-not $scoredRemote) { $scoredRemote = @('Any') }
@@ -497,7 +587,7 @@ function Invoke-Firewall {
         Invoke-Step 'Allow inbound ICMPv4 echo' {
             New-NetFirewallRule -Name 'BT-ICMP' -DisplayName 'BT ICMPv4 Echo' -Direction Inbound -Protocol ICMPv4 -IcmpType 8 -Action Allow -Profile Any | Out-Null }
     }
-    Write-Log 'Review existing allow rules with: Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True | ? Name -notlike "BT-*"' 'INFO'
+    Write-Log 'Default inbound=Block does not disable built-in allow rules. Review with: Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True | Where-Object Name -notlike "BT-*"' 'INFO'
 }
 
 # Services
@@ -505,7 +595,7 @@ function Invoke-Services {
     $disable = @($Config.ServicesToDisable)
     if ($Config.DisableSpooler) { $disable += 'Spooler' }
     foreach ($s in ($disable | Select-Object -Unique)) {
-        if ($Config.ScoredServices -contains $s) { Write-Log "Not disabling $s (scored service)" 'WARN'; continue }
+        if (Test-NameInList -Name $s -List $Config.ScoredServices) { Write-Log "Not disabling $s (scored service)" 'WARN'; continue }
         if (Get-Service -Name $s -ErrorAction SilentlyContinue) {
             Invoke-Step "Stop + disable service $s" {
                 Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
@@ -513,7 +603,7 @@ function Invoke-Services {
             }
         }
     }
-    
+    # Keep scored services up: automatic start + restart on failure
     foreach ($s in $Config.ScoredServices) {
         if (-not (Get-Service -Name $s -ErrorAction SilentlyContinue)) { Write-Log "Scored service '$s' not found on this host" 'WARN'; continue }
         Invoke-Step "Scored service $s -> Automatic, running, auto-restart" {
@@ -573,6 +663,9 @@ function Invoke-Registry {
     }
     foreach ($s in $settings) { Set-Reg -Path $s[0] -Name $s[1] -Value $s[2] }
 
+    # Module logging does nothing unless ModuleNames is populated
+    Set-Reg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging\ModuleNames' -Name '*' -Value '*' -Type 'String'
+
     if ($Config.DisableNetBIOS) {
         Invoke-Step 'Disable NetBIOS over TCP/IP on all adapters' {
             Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' |
@@ -580,7 +673,13 @@ function Invoke-Registry {
         }
     }
     Invoke-Step 'Disable PowerShell v2 (downgrade attacks)' {
-        Disable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2Root -NoRestart | Out-Null
+        $features = @('MicrosoftWindowsPowerShellV2Root', 'MicrosoftWindowsPowerShellV2')
+        foreach ($f in $features) {
+            $feat = Get-WindowsOptionalFeature -Online -FeatureName $f -ErrorAction SilentlyContinue
+            if ($feat -and $feat.State -eq 'Enabled') {
+                Disable-WindowsOptionalFeature -Online -FeatureName $f -NoRestart -ErrorAction Stop | Out-Null
+            }
+        }
     }
 }
 
@@ -588,8 +687,15 @@ function Invoke-Registry {
 function Invoke-SMB {
     Invoke-Step 'Disable SMBv1 server' { Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force }
     Invoke-Step 'Ensure SMBv2/3 enabled' { Set-SmbServerConfiguration -EnableSMB2Protocol $true -Force }
-    Invoke-Step 'Remove SMB1 Windows feature' { Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart | Out-Null }
-    Invoke-Step 'Disable SMB null-session share exposure' { Set-SmbServerConfiguration -RestrictNamedPipeAccessViaQuic $true -Force -ErrorAction SilentlyContinue }
+    Invoke-Step 'Remove SMB1 Windows feature' {
+        $feat = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue
+        if ($feat -and $feat.State -eq 'Enabled') {
+            Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart | Out-Null
+        }
+    }
+    Invoke-Step 'Clear SMB null-session pipes/shares' {
+        Set-SmbServerConfiguration -NullSessionPipes @() -NullSessionShares @() -Force
+    }
     if ($Config.RequireSMBSigning) {
         Invoke-Step 'Require SMB signing (server)' { Set-SmbServerConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Force }
     }
@@ -597,7 +703,8 @@ function Invoke-SMB {
 
 # Auditing / logging
 function Invoke-Audit {
-    Invoke-Step 'Enable success+failure auditing, all categories' { auditpol /set /category:* /success:enable /failure:enable | Out-Null }
+    # Quote /category:* so PowerShell does not expand * to filenames in the current directory
+    Invoke-Step 'Enable success+failure auditing, all categories' { auditpol.exe /set '/category:*' /success:enable /failure:enable | Out-Null }
     foreach ($log in 'Security', 'System', 'Application') {
         Invoke-Step "Grow $log event log to 512MB" { wevtutil sl $log /ms:536870912 }
     }
@@ -606,7 +713,8 @@ function Invoke-Audit {
 
 # Shares
 function Invoke-Shares {
-    $shares = Get-SmbShare | Where-Object { -not $_.Special -and $_.Name -notin 'NETLOGON', 'SYSVOL' -and $Config.AllowedShares -notcontains $_.Name }
+    try { $allShares = Get-SmbShare } catch { Write-Log "Get-SmbShare failed: $($_.Exception.Message)" 'ERROR'; return }
+    $shares = $allShares | Where-Object { -not $_.Special -and $_.Name -notin 'NETLOGON', 'SYSVOL' -and -not (Test-NameInList -Name $_.Name -List $Config.AllowedShares) }
     foreach ($s in $shares) {
         if ($Config.RemoveUnlistedShares) { Invoke-Step "Remove share $($s.Name) ($($s.Path))" { Remove-SmbShare -Name $s.Name -Force } }
         else { Write-Log "Unlisted share: $($s.Name) -> $($s.Path)  (add to AllowedShares or set RemoveUnlistedShares)" 'WARN' }
@@ -650,16 +758,25 @@ function Invoke-RoleSpecific {
 
 # paste host-specific one-offs here
 function Invoke-Custom {
-    # Example:
     # Invoke-Step 'Restart scored service' { Restart-Service W3SVC }
 }
 
+function Test-ShouldRunModule {
+    param([string]$Name, [switch]$Always)
+    if (Test-NameInList -Name $Name -List $Skip) { return $false }
+    if ($Always) { return $true }
+    if ($Only.Count -gt 0) { return (Test-NameInList -Name $Name -List $Only) }
+    return $true
+}
+
 # RUNNER
-Write-Log "Host=$env:COMPUTERNAME Label=$($Config.HostLabel) Role=$($Config.Role) IsDC=$IsDC DryRun=$DryRun InstallTools=$InstallTools"
+Write-Log "Host=$env:COMPUTERNAME Label=$($Config.HostLabel) Role=$($Config.Role) IsDC=$IsDC DryRun=$DryRun InstallTools=$InstallTools Admin=$IsAdmin"
 $order = 'Tools','Backup','Recon','Users','PasswordPolicy','Firewall','Services','Registry','SMB','Audit','Shares','RoleSpecific','Custom'
+$toolsOnly = $InstallTools -and $Only.Count -eq 0
 foreach ($m in $order) {
-    if ($Only.Count -gt 0 -and $Only -notcontains $m) { continue }
-    if ($Skip -contains $m) { continue }
+    if ($toolsOnly -and $m -ne 'Tools') { continue }
+    $always = ($m -eq 'Backup' -or $m -eq 'Recon') -and -not $toolsOnly
+    if (-not (Test-ShouldRunModule -Name $m -Always:$always)) { continue }
     Write-Log "=== Module: $m ===" 'INFO'
     & "Invoke-$m"
 }
